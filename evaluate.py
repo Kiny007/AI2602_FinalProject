@@ -11,7 +11,7 @@ from gan_faces.utils import get_device, load_generator_from_checkpoint, save_jso
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="使用 Inception Score 评估生成头像质量")
+    parser = argparse.ArgumentParser(description="使用 Inception Score 评估 GAN 生成头像质量")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--num-images", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -27,7 +27,7 @@ def main() -> None:
     set_random_seed(args.seed)
     device = get_device(args.device)
 
-    generator, model_args, _ = load_generator_from_checkpoint(args.checkpoint, device)
+    generator, model_args, checkpoint = load_generator_from_checkpoint(args.checkpoint, device)
     latent_dim = int(model_args.get("latent_dim", 100))
 
     mean, std = inception_score(
@@ -45,6 +45,7 @@ def main() -> None:
         "std": std,
         "num_images": args.num_images,
         "splits": args.splits,
+        "model_type": checkpoint.get("model_type", "dcgan"),
         "checkpoint": args.checkpoint,
     }
     save_json(result, args.output_json)

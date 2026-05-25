@@ -12,7 +12,7 @@ from gan_faces.utils import get_device, load_generator_from_checkpoint, make_noi
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="使用 DCGAN 生成头像图片")
+    parser = argparse.ArgumentParser(description="使用训练好的 GAN 生成头像图片")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--num-images", type=int, default=64)
     parser.add_argument("--output", type=str, default="outputs/generated/grid.png")

@@ -5,9 +5,10 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch import nn
 from torchvision.utils import save_image
 
-from .models import Generator
+from .models import Generator, StyleGeneratorLite
 
 
 def ensure_dir(path: str | Path) -> Path:
@@ -57,15 +58,33 @@ def save_json(data: dict[str, Any], output_path: str | Path) -> None:
     output_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def build_generator(model_type: str, model_args: dict[str, Any]) -> nn.Module:
+    """根据 checkpoint 中的模型类型创建对应生成器。"""
+
+    if model_type == "dcgan":
+        return Generator(**model_args)
+    if model_type == "stylegan_lite":
+        return StyleGeneratorLite(**model_args)
+    raise ValueError(f"未知生成器类型: {model_type}")
+
+
+def count_parameters(model: nn.Module) -> int:
+    """统计可训练参数量，用于模型复杂度对比。"""
+
+    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
+
 def load_generator_from_checkpoint(
     checkpoint_path: str | Path,
     device: torch.device,
-) -> tuple[Generator, dict[str, Any], dict[str, Any]]:
+) -> tuple[nn.Module, dict[str, Any], dict[str, Any]]:
     """从训练 checkpoint 中恢复生成器。"""
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model_args = checkpoint.get("model_args", {})
-    generator = Generator(**model_args)
+    # 旧版 DCGAN checkpoint 没有 model_type 字段，因此默认按 dcgan 处理。
+    model_type = checkpoint.get("model_type", "dcgan")
+    generator = build_generator(model_type, model_args)
     generator.load_state_dict(checkpoint["generator"])
     generator.to(device)
     generator.eval()
