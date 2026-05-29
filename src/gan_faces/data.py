@@ -1,3 +1,4 @@
+import random
 from pathlib import Path
 from typing import Optional
 
@@ -37,6 +38,27 @@ class FaceImageFolder(Dataset):
         if self.transform is not None:
             image = self.transform(image)
         return image
+
+
+class UnpairedImageFolder(Dataset):
+    """读取 CycleGAN 所需的两个无配对图片域。"""
+
+    def __init__(
+        self,
+        root_a: str | Path,
+        root_b: str | Path,
+        transform: Optional[transforms.Compose] = None,
+    ) -> None:
+        self.domain_a = FaceImageFolder(root_a, transform=transform)
+        self.domain_b = FaceImageFolder(root_b, transform=transform)
+
+    def __len__(self) -> int:
+        return max(len(self.domain_a), len(self.domain_b))
+
+    def __getitem__(self, index: int):
+        image_a = self.domain_a[index % len(self.domain_a)]
+        image_b = self.domain_b[random.randrange(len(self.domain_b))]
+        return image_a, image_b
 
 
 class ImageOnlyDataset(Dataset):
@@ -107,6 +129,17 @@ def build_dataset(
         return ImageOnlyDataset(dataset)
 
     raise ValueError(f"不支持的数据集类型: {dataset_name}")
+
+
+def build_unpaired_dataset(
+    domain_a_root: str | Path,
+    domain_b_root: str | Path,
+    image_size: int,
+) -> Dataset:
+    """为 CycleGAN 构建 A/B 两个无配对图像域。"""
+
+    transform = build_face_transform(image_size)
+    return UnpairedImageFolder(domain_a_root, domain_b_root, transform=transform)
 
 
 def build_dataloader(

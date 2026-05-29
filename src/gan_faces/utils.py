@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torchvision.utils import save_image
 
-from .models import Generator, StyleGeneratorLite
+from .models import CycleGenerator, Generator, StyleGeneratorLite
 
 
 def ensure_dir(path: str | Path) -> Path:
@@ -65,6 +65,8 @@ def build_generator(model_type: str, model_args: dict[str, Any]) -> nn.Module:
         return Generator(**model_args)
     if model_type == "stylegan_lite":
         return StyleGeneratorLite(**model_args)
+    if model_type in {"cyclegan_a2b", "cyclegan_b2a"}:
+        return CycleGenerator(**model_args)
     raise ValueError(f"未知生成器类型: {model_type}")
 
 
@@ -89,3 +91,23 @@ def load_generator_from_checkpoint(
     generator.to(device)
     generator.eval()
     return generator, model_args, checkpoint
+
+
+def load_cyclegan_generators_from_checkpoint(
+    checkpoint_path: str | Path,
+    device: torch.device,
+) -> tuple[nn.Module, nn.Module, dict[str, Any], dict[str, Any]]:
+    """从 CycleGAN checkpoint 中恢复 A->B 和 B->A 两个生成器。"""
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if checkpoint.get("model_type") != "cyclegan":
+        raise ValueError(f"checkpoint 不是 CycleGAN: {checkpoint_path}")
+
+    model_args = checkpoint.get("generator_args", checkpoint.get("model_args", {}))
+    generator_a2b = CycleGenerator(**model_args)
+    generator_b2a = CycleGenerator(**model_args)
+    generator_a2b.load_state_dict(checkpoint["generator_a2b"])
+    generator_b2a.load_state_dict(checkpoint["generator_b2a"])
+    generator_a2b.to(device).eval()
+    generator_b2a.to(device).eval()
+    return generator_a2b, generator_b2a, model_args, checkpoint

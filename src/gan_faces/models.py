@@ -71,6 +71,100 @@ class Discriminator(nn.Module):
         return self.net(image).view(-1)
 
 
+class CycleResidualBlock(nn.Module):
+    """CycleGAN 生成器中的残差块，保持特征图尺寸不变。"""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=0, bias=False),
+            nn.InstanceNorm2d(channels, affine=True),
+            nn.ReLU(inplace=True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=0, bias=False),
+            nn.InstanceNorm2d(channels, affine=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
+
+
+class CycleGenerator(nn.Module):
+    """CycleGAN 的 ResNet 生成器，用于无配对图像域转换。
+
+    输入和输出都是 64x64 RGB 图像，像素范围为 [-1, 1]。与 DCGAN 不同，
+    CycleGAN 生成器不是从噪声采样，而是把源域图片翻译到目标域。
+    """
+
+    def __init__(
+        self,
+        image_channels: int = 3,
+        feature_maps: int = 64,
+        num_residual_blocks: int = 6,
+    ) -> None:
+        super().__init__()
+        ngf = feature_maps
+
+        layers: list[nn.Module] = [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(image_channels, ngf, kernel_size=7, stride=1, padding=0, bias=False),
+            nn.InstanceNorm2d(ngf, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ngf, ngf * 2, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(ngf * 2, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ngf * 2, ngf * 4, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(ngf * 4, affine=True),
+            nn.ReLU(inplace=True),
+        ]
+
+        layers.extend(CycleResidualBlock(ngf * 4) for _ in range(num_residual_blocks))
+        layers.extend(
+            [
+                nn.ConvTranspose2d(ngf * 4, ngf * 2, kernel_size=4, stride=2, padding=1, bias=False),
+                nn.InstanceNorm2d(ngf * 2, affine=True),
+                nn.ReLU(inplace=True),
+                nn.ConvTranspose2d(ngf * 2, ngf, kernel_size=4, stride=2, padding=1, bias=False),
+                nn.InstanceNorm2d(ngf, affine=True),
+                nn.ReLU(inplace=True),
+                nn.ReflectionPad2d(3),
+                nn.Conv2d(ngf, image_channels, kernel_size=7, stride=1, padding=0),
+                nn.Tanh(),
+            ]
+        )
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        return self.net(image)
+
+
+class PatchDiscriminator(nn.Module):
+    """CycleGAN 使用的 PatchGAN 判别器，输出局部 patch 的真假 logits。"""
+
+    def __init__(self, image_channels: int = 3, feature_maps: int = 64) -> None:
+        super().__init__()
+        ndf = feature_maps
+
+        self.net = nn.Sequential(
+            nn.Conv2d(image_channels, ndf, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(ndf * 2, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(ndf * 4, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(ndf * 8, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1, padding=1),
+        )
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        return self.net(image)
+
+
 class PixelNorm(nn.Module):
     """对潜变量做逐样本归一化，缓解 StyleGAN 映射网络输入尺度不稳定的问题。"""
 
@@ -213,3 +307,15 @@ def init_stylegan_lite_weights(module: nn.Module) -> None:
         nn.init.normal_(module.weight.data, 0.0, 0.02)
         if module.bias is not None:
             nn.init.zeros_(module.bias.data)
+
+
+def init_cyclegan_weights(module: nn.Module) -> None:
+    """CycleGAN 论文常用的卷积/归一化层初始化。"""
+
+    if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.normal_(module.weight.data, 0.0, 0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias.data)
+    elif isinstance(module, nn.InstanceNorm2d) and module.affine:
+        nn.init.normal_(module.weight.data, 1.0, 0.02)
+        nn.init.zeros_(module.bias.data)
