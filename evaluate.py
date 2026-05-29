@@ -1,3 +1,9 @@
+"""Inception Score 评估入口。
+
+本脚本加载训练好的生成器，批量生成图片，并调用 metrics.py 中的
+Inception Score 实现评估生成图像质量，结果同时打印并保存为 JSON。
+"""
+
 import argparse
 import sys
 from pathlib import Path
@@ -11,6 +17,8 @@ from gan_faces.utils import get_device, load_generator_from_checkpoint, save_jso
 
 
 def parse_args() -> argparse.Namespace:
+    """解析 IS 评估所需的 checkpoint、采样数量和输出路径参数。"""
+
     parser = argparse.ArgumentParser(description="使用 Inception Score 评估 GAN 生成头像质量")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--num-images", type=int, default=5000)
@@ -23,11 +31,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """执行生成器加载、IS 计算和评估结果保存。"""
+
     args = parse_args()
     set_random_seed(args.seed)
     device = get_device(args.device)
 
     generator, model_args, checkpoint = load_generator_from_checkpoint(args.checkpoint, device)
+    # 不同生成器可以有不同潜变量维度，因此从 checkpoint 的 model_args 中读取。
     latent_dim = int(model_args.get("latent_dim", 100))
 
     mean, std = inception_score(

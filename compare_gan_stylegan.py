@@ -1,3 +1,9 @@
+"""DCGAN 与 StyleGAN-Lite 性能对比入口。
+
+本脚本加载两个已经训练好的生成器 checkpoint，统一评估生成器参数量、
+生成速度和 Inception Score，并把结果保存为 JSON/CSV 供实验报告引用。
+"""
+
 import argparse
 import csv
 import sys
@@ -23,6 +29,8 @@ from gan_faces.utils import (
 
 
 def parse_args() -> argparse.Namespace:
+    """解析 DCGAN 和 StyleGAN-Lite 对比实验的命令行参数。"""
+
     parser = argparse.ArgumentParser(description="对比 DCGAN 与轻量 StyleGAN 风格模型的性能差异")
     parser.add_argument("--dcgan-checkpoint", type=str, required=True)
     parser.add_argument("--stylegan-checkpoint", type=str, required=True)
@@ -130,11 +138,14 @@ def evaluate_one(
 
 
 def main() -> None:
+    """依次评估两个模型，并把汇总结果写入文件。"""
+
     args = parse_args()
     set_random_seed(args.seed)
     device = get_device(args.device)
 
     rows = [
+        # 两个模型使用相同 num_images、batch_size 和 splits，保证指标可比。
         evaluate_one(
             name="DCGAN",
             checkpoint_path=args.dcgan_checkpoint,

@@ -1,3 +1,9 @@
+"""生成质量评估指标。
+
+本文件实现 Inception Score，用于评估生成图像的清晰度和多样性。
+它既支持从噪声生成图片的 GAN，也支持外部传入图片批次的 CycleGAN。
+"""
+
 from __future__ import annotations
 
 import math

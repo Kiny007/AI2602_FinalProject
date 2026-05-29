@@ -1,3 +1,10 @@
+"""DCGAN 与 CycleGAN 性能对比入口。
+
+DCGAN 是从随机噪声生成图片的无条件生成模型；CycleGAN 是从源域图片
+翻译到目标域的图像到图像模型。本脚本把二者的参数量、速度和 IS 放到
+同一张表中，同时额外计算 CycleGAN 的循环重建误差 cycle_l1。
+"""
+
 import argparse
 import csv
 import sys
@@ -25,6 +32,8 @@ from gan_faces.utils import (
 
 
 def parse_args() -> argparse.Namespace:
+    """解析基础 GAN 与 CycleGAN 对比实验的命令行参数。"""
+
     parser = argparse.ArgumentParser(description="对比基础 DCGAN 与 CycleGAN 的性能差异")
     parser.add_argument("--dcgan-checkpoint", type=str, required=True)
     parser.add_argument("--cyclegan-checkpoint", type=str, required=True)
@@ -44,6 +53,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def count_state_dict_parameters(state_dict: dict[str, torch.Tensor]) -> int:
+    """统计 checkpoint 中某个 state_dict 的参数总量。"""
+
     return sum(tensor.numel() for tensor in state_dict.values())
 
 
@@ -55,6 +66,8 @@ def measure_dcgan_speed(
     batch_size: int,
     device: torch.device,
 ) -> tuple[float, float]:
+    """测量 DCGAN 从随机噪声生成图片的推理速度。"""
+
     generator.eval()
     generated = 0
 
@@ -104,6 +117,8 @@ def measure_image_to_image_speed(
     source_batches: list[torch.Tensor],
     device: torch.device,
 ) -> tuple[float, float]:
+    """测量 CycleGAN 对已有图片做图像到图像翻译的推理速度。"""
+
     generator.eval()
     num_images = sum(batch.size(0) for batch in source_batches)
 
@@ -128,6 +143,8 @@ def measure_cycle_l1(
     source_batches: list[torch.Tensor],
     device: torch.device,
 ) -> float:
+    """计算 CycleGAN 的平均循环重建 L1 误差，数值越低表示重建越接近源图。"""
+
     forward_generator.eval()
     backward_generator.eval()
     total = 0.0
@@ -148,12 +165,16 @@ def translated_batches(
     source_batches: list[torch.Tensor],
     device: torch.device,
 ):
+    """按批次生成 CycleGAN 翻译图片，供 IS 评估函数流式消费。"""
+
     with torch.no_grad():
         for batch in source_batches:
             yield generator(batch.to(device, non_blocking=True))
 
 
 def write_csv(rows: list[dict[str, float | int | str]], output_path: str | Path) -> None:
+    """把对比结果保存为 CSV 表格，便于复制到实验报告。"""
+
     output_path = Path(output_path)
     ensure_dir(output_path.parent)
     fieldnames = [
@@ -177,6 +198,8 @@ def write_csv(rows: list[dict[str, float | int | str]], output_path: str | Path)
 
 
 def main() -> None:
+    """执行 DCGAN 和指定方向 CycleGAN 的完整对比评估。"""
+
     args = parse_args()
     set_random_seed(args.seed)
     device = get_device(args.device)
@@ -184,8 +207,10 @@ def main() -> None:
     dataset = build_unpaired_dataset(args.domain_a_root, args.domain_b_root, args.image_size)
     dataloader = build_dataloader(dataset, args.batch_size, args.workers, drop_last=False)
     source_domain = "a" if args.direction == "a2b" else "b"
+    # 预取源域图片，使速度测试主要反映模型推理而不是磁盘读取。
     source_batches = collect_domain_batches(dataloader, source_domain, args.num_images)
 
+    # DCGAN 分支：随机噪声 -> 生成图片。
     dcgan, dcgan_args, dcgan_checkpoint = load_generator_from_checkpoint(args.dcgan_checkpoint, device)
     latent_dim = int(dcgan_args.get("latent_dim", 100))
     dcgan_seconds, dcgan_ips = measure_dcgan_speed(
@@ -207,15 +232,18 @@ def main() -> None:
     if "discriminator" in dcgan_checkpoint:
         dcgan_total_parameters += count_state_dict_parameters(dcgan_checkpoint["discriminator"])
 
+    # CycleGAN 分支：真实源域图片 -> 目标域翻译图片。
     generator_a2b, generator_b2a, _, cycle_checkpoint = load_cyclegan_generators_from_checkpoint(
         args.cyclegan_checkpoint,
         device,
     )
     if args.direction == "a2b":
+        # A->B 时，forward 负责翻译，backward 负责循环重建回 A。
         cycle_forward = generator_a2b
         cycle_backward = generator_b2a
         cycle_name = "CycleGAN A->B"
     else:
+        # B->A 时，forward/backward 的方向相反。
         cycle_forward = generator_b2a
         cycle_backward = generator_a2b
         cycle_name = "CycleGAN B->A"
@@ -265,6 +293,7 @@ def main() -> None:
     ]
 
     result = {
+        # notes 说明两个模型任务定义不同，避免报告中误读指标含义。
         "metric": "DCGAN vs CycleGAN comparison",
         "num_images": args.num_images,
         "batch_size": args.batch_size,

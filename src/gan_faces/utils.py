@@ -1,3 +1,9 @@
+"""项目通用工具函数。
+
+本文件提供训练和评估脚本共享的基础能力：创建目录、固定随机种子、
+选择运行设备、保存图片/JSON、统计参数量以及从 checkpoint 恢复生成器。
+"""
+
 import json
 import random
 from pathlib import Path

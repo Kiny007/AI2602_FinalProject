@@ -1,3 +1,9 @@
+"""StyleGAN-Lite 训练入口。
+
+本脚本沿用 DCGAN 的判别器和训练框架，但把生成器替换为轻量
+StyleGAN 风格结构，用于与基础 DCGAN 做模型复杂度和生成质量对比。
+"""
+
 import argparse
 import csv
 import sys
@@ -16,6 +22,8 @@ from gan_faces.utils import ensure_dir, get_device, make_noise, save_generated_g
 
 
 def parse_args() -> argparse.Namespace:
+    """解析 StyleGAN-Lite 训练相关的命令行参数。"""
+
     parser = argparse.ArgumentParser(description="训练轻量 StyleGAN 风格人头图像生成模型")
     parser.add_argument("--dataset", choices=["folder", "lfw", "celeba"], default="folder")
     parser.add_argument("--data-root", type=str, default="data/faces")
@@ -42,6 +50,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def write_log_header(log_path: Path) -> None:
+    """创建训练日志 CSV，并写入字段名。"""
+
     if not log_path.exists():
         with log_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -49,12 +59,16 @@ def write_log_header(log_path: Path) -> None:
 
 
 def append_log(log_path: Path, row: list[float | int]) -> None:
+    """向训练日志追加当前 step 的损失和判别器输出。"""
+
     with log_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(row)
 
 
 def main() -> None:
+    """组织 StyleGAN-Lite 的数据加载、模型初始化、训练和保存流程。"""
+
     args = parse_args()
     if args.image_size != 64:
         raise ValueError("当前轻量 StyleGAN 结构固定输出 64x64 图片，请保持 --image-size 64")
@@ -63,6 +77,7 @@ def main() -> None:
     device = get_device(args.device)
     torch.backends.cudnn.benchmark = device.type == "cuda"
 
+    # StyleGAN-Lite 单独放在 outputs/stylegan_lite，避免和 DCGAN checkpoint 混淆。
     output_dir = ensure_dir(args.output_dir)
     sample_dir = ensure_dir(output_dir / "samples")
     checkpoint_dir = ensure_dir(output_dir / "checkpoints")
@@ -97,6 +112,7 @@ def main() -> None:
 
     start_epoch = 1
     if args.resume:
+        # 只允许从 StyleGAN-Lite checkpoint 恢复，防止误加载 DCGAN 权重。
         checkpoint = torch.load(args.resume, map_location=device)
         if checkpoint.get("model_type") != "stylegan_lite":
             raise ValueError("resume checkpoint 不是 stylegan_lite 模型")
@@ -157,12 +173,14 @@ def main() -> None:
                 )
 
         if epoch % args.sample_every == 0 or epoch == args.epochs:
+            # 固定潜变量样例用于横向观察 StyleGAN-Lite 的训练进展。
             generator.eval()
             with torch.no_grad():
                 samples = generator(fixed_noise)
             save_generated_grid(samples, sample_dir / f"epoch_{epoch:04d}.png", nrow=8)
 
         state = {
+            # 记录 model_type，后续 generate/evaluate 脚本会据此重建正确生成器。
             "model_type": "stylegan_lite",
             "epoch": epoch,
             "generator": generator.state_dict(),

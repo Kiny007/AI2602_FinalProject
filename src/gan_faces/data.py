@@ -1,3 +1,9 @@
+"""数据集和 DataLoader 构建工具。
+
+本文件负责把本地图片文件夹、torchvision 人脸数据集以及 CycleGAN 的
+无配对 A/B 双域图片统一转换为训练脚本可直接使用的 PyTorch Dataset。
+"""
+
 import random
 from pathlib import Path
 from typing import Optional
@@ -30,9 +36,13 @@ class FaceImageFolder(Dataset):
             raise ValueError(f"未在 {self.root} 中找到图片文件")
 
     def __len__(self) -> int:
+        """返回可用图片数量。"""
+
         return len(self.paths)
 
     def __getitem__(self, index: int):
+        """读取单张图片，转换为 RGB 后应用预处理。"""
+
         path = self.paths[index]
         image = Image.open(path).convert("RGB")
         if self.transform is not None:
@@ -53,9 +63,13 @@ class UnpairedImageFolder(Dataset):
         self.domain_b = FaceImageFolder(root_b, transform=transform)
 
     def __len__(self) -> int:
+        """返回较大域的长度，让较小域可以重复随机采样。"""
+
         return max(len(self.domain_a), len(self.domain_b))
 
     def __getitem__(self, index: int):
+        """返回一张 A 域图片和一张随机 B 域图片，二者不要求成对。"""
+
         image_a = self.domain_a[index % len(self.domain_a)]
         image_b = self.domain_b[random.randrange(len(self.domain_b))]
         return image_a, image_b
@@ -68,9 +82,13 @@ class ImageOnlyDataset(Dataset):
         self.dataset = dataset
 
     def __len__(self) -> int:
+        """返回被包装 torchvision 数据集的样本数量。"""
+
         return len(self.dataset)
 
     def __getitem__(self, index: int):
+        """丢弃标签或属性，只返回图片张量。"""
+
         item = self.dataset[index]
         # torchvision 的人脸数据集通常返回 (image, target)，训练 GAN 只需要 image。
         if isinstance(item, tuple):

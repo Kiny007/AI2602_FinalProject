@@ -1,3 +1,9 @@
+"""生成图片入口。
+
+本脚本加载训练好的 DCGAN 或 StyleGAN-Lite checkpoint，采样随机潜变量，
+并把生成的人头图像保存为网格图，常用于训练后快速检查模型效果。
+"""
+
 import argparse
 import sys
 from pathlib import Path
@@ -12,6 +18,8 @@ from gan_faces.utils import get_device, load_generator_from_checkpoint, make_noi
 
 
 def parse_args() -> argparse.Namespace:
+    """解析生成图片所需的 checkpoint、图片数量和输出路径参数。"""
+
     parser = argparse.ArgumentParser(description="使用训练好的 GAN 生成头像图片")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--num-images", type=int, default=64)
@@ -23,11 +31,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """加载生成器 checkpoint，采样噪声并保存生成图片网格。"""
+
     args = parse_args()
     set_random_seed(args.seed)
     device = get_device(args.device)
 
     generator, model_args, _ = load_generator_from_checkpoint(args.checkpoint, device)
+    # checkpoint 中保存了 latent_dim；旧 checkpoint 缺失时默认使用 100。
     latent_dim = int(model_args.get("latent_dim", 100))
 
     # 一次性生成指定数量的头像，并保存为图片网格。

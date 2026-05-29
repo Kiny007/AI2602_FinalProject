@@ -1,3 +1,9 @@
+"""DCGAN 训练入口。
+
+本脚本负责读取人脸数据集、构建 DCGAN 生成器和判别器、执行对抗训练，
+并周期性保存训练日志、样例图片和 checkpoint。
+"""
+
 import argparse
 import csv
 import sys
@@ -16,6 +22,8 @@ from gan_faces.utils import ensure_dir, get_device, make_noise, save_generated_g
 
 
 def parse_args() -> argparse.Namespace:
+    """解析 DCGAN 训练所需的命令行参数。"""
+
     parser = argparse.ArgumentParser(description="训练 DCGAN 人头图像生成模型")
     parser.add_argument("--dataset", choices=["folder", "lfw", "celeba"], default="folder")
     parser.add_argument("--data-root", type=str, default="data/faces")
@@ -39,6 +47,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def write_log_header(log_path: Path) -> None:
+    """创建训练日志 CSV，并写入表头。"""
+
     if not log_path.exists():
         with log_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -46,12 +56,16 @@ def write_log_header(log_path: Path) -> None:
 
 
 def append_log(log_path: Path, row: list[float | int]) -> None:
+    """向训练日志追加一行损失和判别器输出统计。"""
+
     with log_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(row)
 
 
 def main() -> None:
+    """组织完整 DCGAN 训练流程：数据、模型、优化器、训练循环和保存。"""
+
     args = parse_args()
     if args.image_size != 64:
         raise ValueError("当前 DCGAN 结构固定输出 64x64 图片，请保持 --image-size 64")
@@ -60,6 +74,7 @@ def main() -> None:
     device = get_device(args.device)
     torch.backends.cudnn.benchmark = device.type == "cuda"
 
+    # 所有实验产物统一写入 output_dir，便于后续生成图片和评估脚本复用。
     output_dir = ensure_dir(args.output_dir)
     sample_dir = ensure_dir(output_dir / "samples")
     checkpoint_dir = ensure_dir(output_dir / "checkpoints")
@@ -92,6 +107,7 @@ def main() -> None:
 
     start_epoch = 1
     if args.resume:
+        # resume 时同时恢复模型和优化器，保证动量状态不丢失。
         checkpoint = torch.load(args.resume, map_location=device)
         generator.load_state_dict(checkpoint["generator"])
         discriminator.load_state_dict(checkpoint["discriminator"])
@@ -150,12 +166,14 @@ def main() -> None:
                 )
 
         if epoch % args.sample_every == 0 or epoch == args.epochs:
+            # 使用固定噪声保存样例图，可以直观看到训练过程中的质量变化。
             generator.eval()
             with torch.no_grad():
                 samples = generator(fixed_noise)
             save_generated_grid(samples, sample_dir / f"epoch_{epoch:04d}.png", nrow=8)
 
         state = {
+            # checkpoint 保存模型结构参数和训练参数，方便跨脚本加载。
             "model_type": "dcgan",
             "epoch": epoch,
             "generator": generator.state_dict(),

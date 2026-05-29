@@ -1,3 +1,10 @@
+"""CycleGAN 训练入口。
+
+本脚本用于无配对图像域转换实验：从域 A 图片学习 A->B 生成器，
+从域 B 图片学习 B->A 生成器，并通过循环一致性损失约束两次转换后
+能回到原图。适合用于和基础 DCGAN 做“改进 GAN”对比。
+"""
+
 import argparse
 import csv
 import sys
@@ -16,6 +23,8 @@ from gan_faces.utils import ensure_dir, get_device, save_generated_grid, set_ran
 
 
 def parse_args() -> argparse.Namespace:
+    """解析 CycleGAN 双域训练所需的命令行参数。"""
+
     parser = argparse.ArgumentParser(description="训练 CycleGAN 无配对图像域转换模型")
     parser.add_argument("--domain-a-root", type=str, required=True, help="源域 A 图片目录")
     parser.add_argument("--domain-b-root", type=str, required=True, help="目标域 B 图片目录")
@@ -41,6 +50,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def write_log_header(log_path: Path) -> None:
+    """创建 CycleGAN 训练日志 CSV，并写入所有损失字段。"""
+
     if not log_path.exists():
         with log_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -60,12 +71,16 @@ def write_log_header(log_path: Path) -> None:
 
 
 def append_log(log_path: Path, row: list[float | int]) -> None:
+    """向 CycleGAN 训练日志追加一行当前 step 的损失。"""
+
     with log_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(row)
 
 
 def set_requires_grad(models: list[nn.Module], requires_grad: bool) -> None:
+    """批量开关模型参数梯度，用于交替训练生成器和判别器。"""
+
     for model in models:
         for parameter in model.parameters():
             parameter.requires_grad = requires_grad
@@ -77,6 +92,8 @@ def discriminator_loss(
     real_images: torch.Tensor,
     fake_images: torch.Tensor,
 ) -> torch.Tensor:
+    """计算单个 PatchGAN 判别器的 LSGAN 损失。"""
+
     real_logits = discriminator(real_images)
     fake_logits = discriminator(fake_images.detach())
     loss_real = criterion(real_logits, torch.ones_like(real_logits))
@@ -92,6 +109,8 @@ def save_cycle_samples(
     fixed_b: torch.Tensor,
     output_path: Path,
 ) -> None:
+    """保存 CycleGAN 可视化样例：原图、翻译图和循环重建图。"""
+
     generator_a2b.eval()
     generator_b2a.eval()
 
@@ -104,6 +123,8 @@ def save_cycle_samples(
 
 
 def main() -> None:
+    """组织 CycleGAN 的双域数据加载、四个网络训练和 checkpoint 保存。"""
+
     args = parse_args()
     if args.image_size != 64:
         raise ValueError("当前 CycleGAN 结构按 64x64 图片配置，请保持 --image-size 64")
@@ -112,6 +133,7 @@ def main() -> None:
     device = get_device(args.device)
     torch.backends.cudnn.benchmark = device.type == "cuda"
 
+    # CycleGAN 会产生样例图、checkpoint 和训练日志，统一放到 output_dir 下。
     output_dir = ensure_dir(args.output_dir)
     sample_dir = ensure_dir(output_dir / "samples")
     checkpoint_dir = ensure_dir(output_dir / "checkpoints")
@@ -127,6 +149,7 @@ def main() -> None:
     )
 
     fixed_a, fixed_b = next(iter(dataloader))
+    # 固定少量 A/B 图片，便于每个 epoch 观察翻译结果是否逐渐稳定。
     sample_count = min(4, fixed_a.size(0), fixed_b.size(0))
     fixed_a = fixed_a[:sample_count].to(device)
     fixed_b = fixed_b[:sample_count].to(device)
@@ -167,6 +190,7 @@ def main() -> None:
 
     start_epoch = 1
     if args.resume:
+        # CycleGAN 需要同时恢复两个生成器、两个判别器以及两个优化器。
         checkpoint = torch.load(args.resume, map_location=device)
         if checkpoint.get("model_type") != "cyclegan":
             raise ValueError("resume checkpoint 不是 CycleGAN 模型")
@@ -189,6 +213,7 @@ def main() -> None:
             real_a = real_a.to(device, non_blocking=True)
             real_b = real_b.to(device, non_blocking=True)
 
+            # 第一阶段：冻结判别器，只更新两个生成器。
             set_requires_grad([discriminator_a, discriminator_b], False)
             optimizer_g.zero_grad(set_to_none=True)
 
@@ -204,6 +229,7 @@ def main() -> None:
             loss_cycle = criterion_cycle(rec_a, real_a) + criterion_cycle(rec_b, real_b)
 
             if args.lambda_identity > 0:
+                # 身份损失鼓励生成器在输入已经属于目标域时尽量保持原图内容。
                 same_a = generator_b2a(real_a)
                 same_b = generator_a2b(real_b)
                 loss_identity = criterion_cycle(same_a, real_a) + criterion_cycle(same_b, real_b)
@@ -219,6 +245,7 @@ def main() -> None:
             loss_g.backward()
             optimizer_g.step()
 
+            # 第二阶段：解冻判别器，用真实图和生成图训练 PatchGAN。
             set_requires_grad([discriminator_a, discriminator_b], True)
             optimizer_d.zero_grad(set_to_none=True)
             loss_d_a = discriminator_loss(discriminator_a, criterion_gan, real_a, fake_a)
@@ -249,6 +276,7 @@ def main() -> None:
                 )
 
         if epoch % args.sample_every == 0 or epoch == args.epochs:
+            # 每个采样周期保存 A->B->A 和 B->A->B 的可视化结果。
             save_cycle_samples(
                 generator_a2b,
                 generator_b2a,
@@ -258,6 +286,7 @@ def main() -> None:
             )
 
         state = {
+            # 保存完整 CycleGAN 状态，便于继续训练或做 A->B/B->A 对比评估。
             "model_type": "cyclegan",
             "epoch": epoch,
             "generator_a2b": generator_a2b.state_dict(),

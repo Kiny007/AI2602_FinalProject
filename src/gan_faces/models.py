@@ -1,3 +1,10 @@
+"""GAN 模型结构定义。
+
+本文件集中定义项目中用到的神经网络模块：
+DCGAN 生成器/判别器、CycleGAN 生成器/PatchGAN 判别器，以及轻量
+StyleGAN 风格生成器。训练脚本只负责组织训练流程，模型细节统一放在这里。
+"""
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -34,6 +41,8 @@ class Generator(nn.Module):
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """把形状为 [N, latent_dim] 或 [N, latent_dim, 1, 1] 的噪声映射为图片。"""
+
         if z.ndim == 2:
             z = z[:, :, None, None]
         return self.net(z)
@@ -68,6 +77,8 @@ class Discriminator(nn.Module):
         )
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """输入图片张量，输出每张图片对应的真假 logits。"""
+
         return self.net(image).view(-1)
 
 
@@ -87,6 +98,8 @@ class CycleResidualBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """返回残差连接后的特征图，用于增强 CycleGAN 生成器表达能力。"""
+
         return x + self.block(x)
 
 
@@ -136,6 +149,8 @@ class CycleGenerator(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """把源域图片翻译为目标域图片，输出范围仍为 [-1, 1]。"""
+
         return self.net(image)
 
 
@@ -162,6 +177,8 @@ class PatchDiscriminator(nn.Module):
         )
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """输出 patch 级别的真假 logits，而不是单个全图真假分数。"""
+
         return self.net(image)
 
 
@@ -169,6 +186,8 @@ class PixelNorm(nn.Module):
     """对潜变量做逐样本归一化，缓解 StyleGAN 映射网络输入尺度不稳定的问题。"""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """对每个样本的通道维度做归一化，保持潜变量尺度稳定。"""
+
         return x * torch.rsqrt(torch.mean(x.pow(2), dim=1, keepdim=True) + 1e-8)
 
 
@@ -192,6 +211,8 @@ class MappingNetwork(nn.Module):
         self.net = nn.Sequential(*modules)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """把原始随机噪声 z 映射到 StyleGAN 使用的风格向量 w。"""
+
         if z.ndim == 4:
             z = z.flatten(1)
         return self.net(z)
@@ -205,6 +226,8 @@ class NoiseInjection(nn.Module):
         self.weight = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """给每个样本、每个空间位置注入可学习强度的随机噪声。"""
+
         noise = torch.randn(x.size(0), 1, x.size(2), x.size(3), device=x.device, dtype=x.dtype)
         return x + self.weight * noise
 
@@ -220,6 +243,8 @@ class AdaptiveInstanceNorm(nn.Module):
         nn.init.zeros_(self.style.bias)
 
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+        """根据 style 向量生成通道缩放和平移参数，并调制输入特征。"""
+
         style_params = self.style(style).view(style.size(0), 2, x.size(1), 1, 1)
         gamma = style_params[:, 0] + 1.0
         beta = style_params[:, 1]
@@ -238,6 +263,8 @@ class StyledConvBlock(nn.Module):
         self.activation = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+        """执行可选上采样、卷积、噪声注入和 AdaIN 风格调制。"""
+
         if self.upsample:
             x = F.interpolate(x, scale_factor=2, mode="nearest")
         x = self.conv(x)
@@ -282,6 +309,8 @@ class StyleGeneratorLite(nn.Module):
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """从噪声生成头像图片，内部先映射风格向量再逐层调制特征。"""
+
         style = self.mapping(z)
         x = self.constant.repeat(z.size(0), 1, 1, 1)
         for block in self.blocks:
