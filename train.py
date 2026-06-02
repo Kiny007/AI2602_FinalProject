@@ -8,6 +8,7 @@ import argparse
 import csv
 import sys
 from pathlib import Path
+from typing import Sequence, Union
 
 import torch
 from torch import nn, optim
@@ -18,6 +19,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from gan_faces.data import build_dataloader, build_dataset
 from gan_faces.models import Discriminator, Generator, init_dcgan_weights
+from gan_faces.tensorboard import (
+    add_sample_images,
+    add_training_scalars,
+    close_summary_writer,
+    create_summary_writer,
+)
 from gan_faces.utils import ensure_dir, get_device, make_noise, save_generated_grid, set_random_seed
 
 
@@ -40,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--sample-every", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=5)
+    parser.add_argument("--tensorboard-dir", type=str, default="", help="TensorBoard 日志目录，默认 output-dir/tensorboard")
+    parser.add_argument("--no-tensorboard", action="store_true", help="关闭 TensorBoard 日志写入")
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
@@ -55,7 +64,7 @@ def write_log_header(log_path: Path) -> None:
             writer.writerow(["epoch", "step", "loss_d", "loss_g", "d_real", "d_fake"])
 
 
-def append_log(log_path: Path, row: list[float | int]) -> None:
+def append_log(log_path: Path, row: Sequence[Union[float, int]]) -> None:
     """向训练日志追加一行损失和判别器输出统计。"""
 
     with log_path.open("a", newline="", encoding="utf-8") as f:
@@ -80,6 +89,12 @@ def main() -> None:
     checkpoint_dir = ensure_dir(output_dir / "checkpoints")
     log_path = output_dir / "train_log.csv"
     write_log_header(log_path)
+    tensorboard_dir = ensure_dir(args.tensorboard_dir or output_dir / "tensorboard")
+    writer = None
+    if not args.no_tensorboard:
+        writer = create_summary_writer(tensorboard_dir)
+        print(f"TensorBoard 日志目录: {tensorboard_dir}")
+        print(f"查看命令: tensorboard --logdir {tensorboard_dir}")
 
     dataset = build_dataset(args.dataset, args.data_root, args.image_size, download=args.download)
     drop_last = len(dataset) >= args.batch_size
@@ -104,6 +119,7 @@ def main() -> None:
     criterion = nn.BCEWithLogitsLoss()
     optimizer_g = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
     optimizer_d = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
+
 
     start_epoch = 1
     if args.resume:
@@ -152,17 +168,31 @@ def main() -> None:
             loss_g.backward()
             optimizer_g.step()
 
+            global_step = (epoch - 1) * len(dataloader) + step
+            loss_d_value = loss_d.item()
+            loss_g_value = loss_g.item()
+            d_real = torch.sigmoid(real_logits).mean().item()
+            d_fake = torch.sigmoid(fake_logits).mean().item()
+            add_training_scalars(
+                writer=writer,
+                global_step=global_step,
+                loss_d=loss_d_value,
+                loss_g=loss_g_value,
+                d_real=d_real,
+                d_fake=d_fake,
+                lr_g=optimizer_g.param_groups[0]["lr"],
+                lr_d=optimizer_d.param_groups[0]["lr"],
+            )
+
             if step == 1 or step % 50 == 0:
-                d_real = torch.sigmoid(real_logits).mean().item()
-                d_fake = torch.sigmoid(fake_logits).mean().item()
                 print(
                     f"Epoch [{epoch}/{args.epochs}] Step [{step}/{len(dataloader)}] "
-                    f"Loss_D={loss_d.item():.4f} Loss_G={loss_g.item():.4f} "
+                    f"Loss_D={loss_d_value:.4f} Loss_G={loss_g_value:.4f} "
                     f"D(real)={d_real:.4f} D(fake)={d_fake:.4f}"
                 )
                 append_log(
                     log_path,
-                    [epoch, step, loss_d.item(), loss_g.item(), d_real, d_fake],
+                    [epoch, step, loss_d_value, loss_g_value, d_real, d_fake],
                 )
 
         if epoch % args.sample_every == 0 or epoch == args.epochs:
@@ -171,6 +201,7 @@ def main() -> None:
             with torch.no_grad():
                 samples = generator(fixed_noise)
             save_generated_grid(samples, sample_dir / f"epoch_{epoch:04d}.png", nrow=8)
+            add_sample_images(writer, samples, epoch, nrow=8)
 
         state = {
             # checkpoint 保存模型结构参数和训练参数，方便跨脚本加载。
@@ -189,6 +220,7 @@ def main() -> None:
         if epoch % args.save_every == 0 or epoch == args.epochs:
             torch.save(state, checkpoint_dir / f"dcgan_epoch_{epoch:04d}.pt")
 
+    close_summary_writer(writer)
     print("训练完成。")
 
 

@@ -6,7 +6,7 @@
 
 import random
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from PIL import Image, ImageFile
 from torch.utils.data import DataLoader, Dataset
@@ -21,7 +21,7 @@ IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 class FaceImageFolder(Dataset):
     """读取普通图片文件夹，允许图片分散在任意子目录中。"""
 
-    def __init__(self, root: str | Path, transform: Optional[transforms.Compose] = None) -> None:
+    def __init__(self, root: Union[str, Path], transform: Optional[transforms.Compose] = None) -> None:
         self.root = Path(root)
         self.transform = transform
 
@@ -55,8 +55,8 @@ class UnpairedImageFolder(Dataset):
 
     def __init__(
         self,
-        root_a: str | Path,
-        root_b: str | Path,
+        root_a: Union[str, Path],
+        root_b: Union[str, Path],
         transform: Optional[transforms.Compose] = None,
     ) -> None:
         self.domain_a = FaceImageFolder(root_a, transform=transform)
@@ -111,7 +111,7 @@ def build_face_transform(image_size: int) -> transforms.Compose:
 
 def build_dataset(
     dataset_name: str,
-    data_root: str | Path,
+    data_root: Union[str, Path],
     image_size: int,
     download: bool = False,
 ) -> Dataset:
@@ -150,8 +150,8 @@ def build_dataset(
 
 
 def build_unpaired_dataset(
-    domain_a_root: str | Path,
-    domain_b_root: str | Path,
+    domain_a_root: Union[str, Path],
+    domain_b_root: Union[str, Path],
     image_size: int,
 ) -> Dataset:
     """为 CycleGAN 构建 A/B 两个无配对图像域。"""

@@ -1,6 +1,6 @@
 # 基于 GAN 的人头图像生成
 
-本项目根据 `project.pdf` 搭建：使用 DCGAN 完成基础人头图像生成，支持生成样例、潜变量线性插值、Inception Score（IS）评估，并补充 Bonus 1：对比轻量 StyleGAN 风格模型或 CycleGAN 与基础 DCGAN 的性能差异。
+本项目根据 `project.pdf` 搭建：使用 DCGAN 完成基础人头图像生成，支持生成样例、潜变量线性插值、TensorBoard 训练可视化、Inception Score（IS）和 FID 评估，并补充 Bonus 1：对比轻量 StyleGAN 风格模型或 CycleGAN 与基础 DCGAN 的性能差异。
 
 ## 项目结构
 
@@ -11,13 +11,14 @@
 ├── train_cyclegan.py        # 训练 CycleGAN 无配对图像域转换模型
 ├── generate.py              # 使用训练好的生成器生成图片
 ├── interpolate.py           # 在两张生成头像之间做线性插值
-├── evaluate.py              # 使用 IS 评估生成图像质量
+├── evaluate.py              # 使用 IS/FID 评估生成图像质量
 ├── compare_models.py        # 对比 DCGAN 与 StyleGAN-Lite
 ├── compare_gan_cyclegan.py  # 对比 DCGAN 与 CycleGAN
 ├── src/gan_faces/
 │   ├── data.py              # 数据集读取和预处理
 │   ├── models.py            # DCGAN、StyleGAN-Lite、CycleGAN 与判别器
-│   ├── metrics.py           # Inception Score 实现
+│   ├── metrics.py           # Inception Score 和 FID 实现
+│   ├── tensorboard.py       # DCGAN TensorBoard 日志工具
 │   └── utils.py             # 随机种子、保存图片、加载模型等工具
 └── docs/project_requirements.md
 ```
@@ -61,6 +62,19 @@ python train.py --dataset folder --data-root data/celeba/img_align_celeba --outp
 - `outputs/dcgan/checkpoints/dcgan_epoch_XXXX.pt`：阶段性模型权重
 - `outputs/dcgan/samples/epoch_XXXX.png`：固定噪声生成的训练过程样例
 - `outputs/dcgan/train_log.csv`：训练损失日志
+- `outputs/dcgan/tensorboard/`：TensorBoard 事件文件
+
+查看 TensorBoard：
+
+```powershell
+tensorboard --logdir outputs/dcgan/tensorboard
+```
+
+如果只想保存 CSV 和图片、不写 TensorBoard：
+
+```powershell
+python train.py --dataset folder --data-root data/celeba/img_align_celeba --output-dir outputs/dcgan --no-tensorboard
+```
 
 ## Bonus 1：训练 StyleGAN-Lite
 
@@ -113,17 +127,19 @@ python interpolate.py --checkpoint outputs/dcgan/checkpoints/latest.pt --steps 1
 python interpolate.py --checkpoint outputs/stylegan_lite/checkpoints/latest.pt --steps 12 --output outputs/interpolation/stylegan_lite_linear.png
 ```
 
-## IS 评估
+## IS / FID 评估
 
 ```powershell
-python evaluate.py --checkpoint outputs/dcgan/checkpoints/latest.pt --num-images 5000 --batch-size 64 --output-json outputs/metrics/dcgan_is.json
-python evaluate.py --checkpoint outputs/stylegan_lite/checkpoints/latest.pt --num-images 5000 --batch-size 64 --output-json outputs/metrics/stylegan_lite_is.json
+python evaluate.py --metric is --checkpoint outputs/dcgan/checkpoints/latest.pt --num-images 5000 --batch-size 64 --output-json outputs/metrics/dcgan_is.json
+python evaluate.py --metric fid --checkpoint outputs/dcgan/checkpoints/latest.pt --dataset folder --data-root data/celeba/img_align_celeba --num-images 5000 --batch-size 64 --output-json outputs/metrics/dcgan_fid.json
+python evaluate.py --metric both --checkpoint outputs/dcgan/checkpoints/latest.pt --dataset folder --data-root data/celeba/img_align_celeba --num-images 5000 --batch-size 64 --output-json outputs/metrics/dcgan_is_fid.json
 ```
 
-首次运行 IS 评估时，torchvision 可能会下载 Inception v3 的预训练权重。输出格式类似：
+首次运行 IS/FID 评估时，torchvision 可能会下载 Inception v3 的预训练权重。FID 会把生成图片与真实数据集图片的 Inception 特征分布做比较，数值越低通常越好。输出格式类似：
 
 ```text
 Inception Score: mean=2.3142, std=0.0821
+FID: 85.3721
 ```
 
 ## 模型性能对比
@@ -174,7 +190,7 @@ python compare_gan_cyclegan.py --dcgan-checkpoint outputs/dcgan/checkpoints/late
 | 实现基础 GAN 模型（DCGAN） | `src/gan_faces/models.py` |
 | 在数据集上训练并生成头像 | `train.py`、`generate.py` |
 | 测试两张头像之间线性插值 | `interpolate.py` |
-| 使用 FID 或 IS 评估质量 | `evaluate.py` 使用 IS |
+| 使用 FID 或 IS 评估质量 | `evaluate.py` 支持 IS/FID |
 
 ## 已覆盖的 Bonus
 

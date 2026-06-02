@@ -5,6 +5,8 @@
 能回到原图。适合用于和基础 DCGAN 做“改进 GAN”对比。
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import sys

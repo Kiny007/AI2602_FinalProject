@@ -7,7 +7,7 @@
 import json
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
 import numpy as np
 import torch
@@ -17,7 +17,7 @@ from torchvision.utils import save_image
 from .models import CycleGenerator, Generator, StyleGeneratorLite
 
 
-def ensure_dir(path: str | Path) -> Path:
+def ensure_dir(path: Union[str, Path]) -> Path:
     """确保目录存在，并返回 Path 对象。"""
 
     path = Path(path)
@@ -48,7 +48,7 @@ def make_noise(batch_size: int, latent_dim: int, device: torch.device) -> torch.
     return torch.randn(batch_size, latent_dim, 1, 1, device=device)
 
 
-def save_generated_grid(images: torch.Tensor, output_path: str | Path, nrow: int = 8) -> None:
+def save_generated_grid(images: torch.Tensor, output_path: Union[str, Path], nrow: int = 8) -> None:
     """保存图片网格；输入图片范围为 [-1, 1]。"""
 
     output_path = Path(output_path)
@@ -56,7 +56,7 @@ def save_generated_grid(images: torch.Tensor, output_path: str | Path, nrow: int
     save_image(images, output_path, nrow=nrow, normalize=True, value_range=(-1, 1))
 
 
-def save_json(data: dict[str, Any], output_path: str | Path) -> None:
+def save_json(data: dict[str, Any], output_path: Union[str, Path]) -> None:
     """保存 JSON 结果，便于后续写实验报告。"""
 
     output_path = Path(output_path)
@@ -83,7 +83,7 @@ def count_parameters(model: nn.Module) -> int:
 
 
 def load_generator_from_checkpoint(
-    checkpoint_path: str | Path,
+    checkpoint_path: Union[str, Path],
     device: torch.device,
 ) -> tuple[nn.Module, dict[str, Any], dict[str, Any]]:
     """从训练 checkpoint 中恢复生成器。"""
@@ -100,7 +100,7 @@ def load_generator_from_checkpoint(
 
 
 def load_cyclegan_generators_from_checkpoint(
-    checkpoint_path: str | Path,
+    checkpoint_path: Union[str, Path],
     device: torch.device,
 ) -> tuple[nn.Module, nn.Module, dict[str, Any], dict[str, Any]]:
     """从 CycleGAN checkpoint 中恢复 A->B 和 B->A 两个生成器。"""

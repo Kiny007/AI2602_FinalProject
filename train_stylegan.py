@@ -4,6 +4,8 @@
 StyleGAN 风格结构，用于与基础 DCGAN 做模型复杂度和生成质量对比。
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import sys

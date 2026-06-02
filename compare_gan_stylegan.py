@@ -4,6 +4,8 @@
 生成速度和 Inception Score，并把结果保存为 JSON/CSV 供实验报告引用。
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import sys
