@@ -78,7 +78,7 @@ def main() -> None:
     args = parse_args()
     if args.image_size != 64:
         raise ValueError("当前 DCGAN 结构固定输出 64x64 图片，请保持 --image-size 64")
-
+    print(args.data_root)
     set_random_seed(args.seed)
     device = get_device(args.device)
     torch.backends.cudnn.benchmark = device.type == "cuda"
@@ -116,7 +116,7 @@ def main() -> None:
     generator.apply(init_dcgan_weights)
     discriminator.apply(init_dcgan_weights)
 
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCELoss()
     optimizer_g = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
     optimizer_d = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
 
@@ -144,17 +144,17 @@ def main() -> None:
             batch_size = real_images.size(0)
 
             # 训练判别器：真实图片应判为 1，生成图片应判为 0。
-            real_targets = torch.full((batch_size,), 0.9, device=device)
+            real_targets = torch.ones(batch_size, device=device)
             fake_targets = torch.zeros(batch_size, device=device)
 
             optimizer_d.zero_grad(set_to_none=True)
-            real_logits = discriminator(real_images)
-            loss_d_real = criterion(real_logits, real_targets)
+            real_scores = discriminator(real_images)
+            loss_d_real = criterion(real_scores, real_targets)
 
             noise = make_noise(batch_size, args.latent_dim, device)
             fake_images = generator(noise)
-            fake_logits = discriminator(fake_images.detach())
-            loss_d_fake = criterion(fake_logits, fake_targets)
+            fake_scores = discriminator(fake_images.detach())
+            loss_d_fake = criterion(fake_scores, fake_targets)
 
             loss_d = loss_d_real + loss_d_fake
             loss_d.backward()
@@ -163,16 +163,16 @@ def main() -> None:
             # 训练生成器：希望判别器把生成图片也判为真实。
             optimizer_g.zero_grad(set_to_none=True)
             fool_targets = torch.ones(batch_size, device=device)
-            fake_logits_for_g = discriminator(fake_images)
-            loss_g = criterion(fake_logits_for_g, fool_targets)
+            fake_scores_for_g = discriminator(fake_images)
+            loss_g = criterion(fake_scores_for_g, fool_targets)
             loss_g.backward()
             optimizer_g.step()
 
             global_step = (epoch - 1) * len(dataloader) + step
             loss_d_value = loss_d.item()
             loss_g_value = loss_g.item()
-            d_real = torch.sigmoid(real_logits).mean().item()
-            d_fake = torch.sigmoid(fake_logits).mean().item()
+            d_real = real_scores.mean().item()
+            d_fake = fake_scores.mean().item()
             add_training_scalars(
                 writer=writer,
                 global_step=global_step,

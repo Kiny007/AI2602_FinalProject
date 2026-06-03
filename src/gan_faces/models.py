@@ -73,11 +73,12 @@ class Discriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             # N x (ndf*8) x 4 x 4
             nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1, padding=0, bias=False),
-            # 输出 logits，不加 Sigmoid，配合 BCEWithLogitsLoss 更稳定。
+            nn.Sigmoid(),
+            # 输出真假概率，和官方 DCGAN tutorial 的 BCELoss 口径保持一致。
         )
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
-        """输入图片张量，输出每张图片对应的真假 logits。"""
+        """输入图片张量，输出每张图片对应的真假概率。"""
 
         return self.net(image).view(-1)
 
