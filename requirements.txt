@@ -6,3 +6,4 @@ tensorboard>=2.14
 gdown
 requests
 scipy
+PyYAML>=6.0

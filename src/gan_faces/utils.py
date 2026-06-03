@@ -93,7 +93,8 @@ def load_generator_from_checkpoint(
     # 旧版 DCGAN checkpoint 没有 model_type 字段，因此默认按 dcgan 处理。
     model_type = checkpoint.get("model_type", "dcgan")
     generator = build_generator(model_type, model_args)
-    generator.load_state_dict(checkpoint["generator"])
+    generator_state = checkpoint.get("generator_ema", checkpoint["generator"])
+    generator.load_state_dict(generator_state)
     generator.to(device)
     generator.eval()
     return generator, model_args, checkpoint

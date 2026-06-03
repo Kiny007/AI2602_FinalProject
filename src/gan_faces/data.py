@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from PIL import Image, ImageFile
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torchvision import datasets, transforms
 
 
@@ -166,14 +166,20 @@ def build_dataloader(
     num_workers: int,
     shuffle: bool = True,
     drop_last: bool = True,
+    sampler: Sampler | None = None,
 ) -> DataLoader:
     """创建 DataLoader，pin_memory 在有 GPU 时可加速数据搬运。"""
+
+    if sampler is not None:
+        shuffle = False
 
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=drop_last,
+        persistent_workers=num_workers > 0,
     )
