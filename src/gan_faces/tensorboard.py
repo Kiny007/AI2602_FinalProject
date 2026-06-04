@@ -1,8 +1,8 @@
-"""TensorBoard helpers for DCGAN training."""
+"""TensorBoard helpers for GAN training."""
 
 import os
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Mapping, Optional, Union
 
 import torch
 from torchvision.utils import make_grid
@@ -37,12 +37,29 @@ def add_training_scalars(
     if writer is None:
         return
 
-    writer.add_scalar("loss/discriminator", loss_d, global_step)
-    writer.add_scalar("loss/generator", loss_g, global_step)
-    writer.add_scalar("discriminator/real_probability", d_real, global_step)
-    writer.add_scalar("discriminator/fake_probability", d_fake, global_step)
-    writer.add_scalar("learning_rate/generator", lr_g, global_step)
-    writer.add_scalar("learning_rate/discriminator", lr_d, global_step)
+    writer.add_scalar("Loss/loss_d", loss_d, global_step)
+    writer.add_scalar("Loss/loss_g", loss_g, global_step)
+    writer.add_scalar("Loss/d_real", d_real, global_step)
+    writer.add_scalar("Loss/d_fake", d_fake, global_step)
+    writer.add_scalar("LearningRate/generator", lr_g, global_step)
+    writer.add_scalar("LearningRate/discriminator", lr_d, global_step)
+
+
+def add_scalar_groups(writer: Optional[Any], scalars: Mapping[str, float], global_step: int) -> None:
+    """批量写入按层级分组的标量。"""
+
+    if writer is None:
+        return
+    for name, value in scalars.items():
+        writer.add_scalar(name, value, global_step)
+
+
+def add_text_block(writer: Optional[Any], tag: str, text: str, global_step: int = 0) -> None:
+    """写入文本信息，方便记录实验配置。"""
+
+    if writer is None:
+        return
+    writer.add_text(tag, text, global_step)
 
 
 def add_sample_images(
