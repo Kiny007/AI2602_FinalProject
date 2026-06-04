@@ -1,5 +1,6 @@
 torch>=2.1
 torchvision>=0.16
+accelerate>=0.30
 Pillow>=10.0
 numpy>=1.24
 tensorboard>=2.14

@@ -1,7 +1,7 @@
 """DCGAN 训练入口。
 
-在原有课程项目逻辑上补充了更工程化的训练运行时：多卡 DDP、子进程管理、
-EMA 生成器、JSONL/TensorBoard 日志，以及统一的样例图和 checkpoint 快照。
+当前入口采用更偏 NVIDIA 风格的训练组织方式：以 `kimg` 作为统一进度单位，
+并使用 accelerate 管理单卡/多卡与混合精度。
 """
 
 from __future__ import annotations
@@ -13,8 +13,8 @@ import time
 from pathlib import Path
 
 import torch
+from accelerate import Accelerator
 from torch import nn, optim
-from torch.utils.data.distributed import DistributedSampler
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -27,21 +27,13 @@ from gan_faces.eval.evaluate import AI2602GeneratorAdapter
 from gan_faces.eval.nvidia_evaluator import evaluate_adapter, parse_metrics
 from gan_faces.train_runtime import (
     TrainingLogger,
-    average_tensor,
-    barrier,
     cleanup_training_process,
-    cleanup_distributed,
     create_training_layout,
-    find_free_port,
     install_signal_handlers,
     interrupt_requested,
-    maybe_wrap_ddp,
-    prepare_device,
     restore_signal_handlers,
     save_training_options,
     seed_everything,
-    setup_distributed,
-    unwrap_module,
     update_ema,
 )
 from gan_faces.utils import count_parameters, ensure_dir, make_noise, save_generated_grid
@@ -61,7 +53,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=str, default="data/faces")
     parser.add_argument("--download", action="store_true", help="允许 torchvision 下载数据集")
     parser.add_argument("--output-dir", type=str, default="outputs")
-    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=128, help="总 batch size，多卡时会自动按卡均分")
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--latent-dim", type=int, default=100)
@@ -70,26 +61,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--beta1", type=float, default=0.5)
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--sample-every", type=int, default=1)
-    parser.add_argument("--save-every", type=int, default=5)
-    parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument("--kimg-per-log", type=float, default=0.0, help="按 kimg 触发日志，<=0 时退回 log-every")
-    parser.add_argument("--sample-every-kimg", type=float, default=1.0, help="每隔多少 kimg 保存一次样例图，<=0 时退回 sample-every")
-    parser.add_argument("--save-every-kimg", type=float, default=5.0, help="每隔多少 kimg 保存一次 checkpoint，<=0 时退回 save-every")
+    parser.add_argument("--total-kimg", type=float, default=1000.0, help="总训练长度，单位 kimg")
+    parser.add_argument("--kimg-per-log", type=float, default=0.5, help="每隔多少 kimg 打一次日志")
+    parser.add_argument("--sample-every-kimg", type=float, default=1.0, help="每隔多少 kimg 保存一次样例图")
+    parser.add_argument("--save-every-kimg", type=float, default=5.0, help="每隔多少 kimg 保存一次 checkpoint")
     parser.add_argument("--eval-every-kimg", type=float, default=0.0, help="每隔多少 kimg 做一次中间评测，<=0 时关闭")
     parser.add_argument("--metrics", type=str, default="", help="中间评测指标，逗号分隔，如 fid5k,is5k；为空则关闭")
     parser.add_argument("--eval-data-root", type=str, default="", help="中间评测使用的真实数据路径，默认与 data-root 相同")
     parser.add_argument("--eval-verbose", action="store_true", help="打印中间评测的详细进度")
     parser.add_argument("--no-eval-cache", action="store_true", help="禁用中间评测的真实特征缓存")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="生成器 EMA 衰减系数，<=0 时关闭")
-    parser.add_argument("--gpus", type=int, default=1, help="参与训练的 GPU 数量")
-    parser.add_argument("--master-addr", type=str, default="127.0.0.1")
-    parser.add_argument("--master-port", type=str, default="")
     parser.add_argument("--tensorboard-dir", type=str, default="", help="TensorBoard 日志目录，默认 output-dir/tensorboard")
     parser.add_argument("--no-tensorboard", action="store_true", help="关闭 TensorBoard 日志写入")
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--allow-tf32", action="store_true", help="允许 CUDA matmul/conv 使用 TF32 提升吞吐")
     apply_config_defaults(parser, load_yaml_config(config_args.config))
     return parser.parse_args(remaining_argv)
 
@@ -111,7 +98,7 @@ def build_training_components(args: argparse.Namespace, device: torch.device):
     generator.apply(init_dcgan_weights)
     discriminator.apply(init_dcgan_weights)
 
-    criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer_g = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
     optimizer_d = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
     return generator, discriminator, criterion, optimizer_g, optimizer_d, model_args, disc_args
@@ -126,14 +113,17 @@ def _next_kimg_boundary(cur_nimg: int, interval_kimg: float) -> int | None:
     return ((cur_nimg // interval_nimg) + 1) * interval_nimg
 
 
-def train_worker(rank: int, args: argparse.Namespace) -> None:
-    """单个训练子进程：单卡时直接运行，多卡时由 spawn 启动。"""
+def train(args: argparse.Namespace) -> None:
+    """使用 accelerate 统一单卡、多卡与混合精度训练。"""
 
-    world_size = args.gpus
-    device = prepare_device(args.device, rank, world_size)
-    setup_distributed(rank, world_size, device, args.master_addr, args.master_port)
-    seed_everything(args.seed + rank)
+    accelerator = Accelerator(gradient_accumulation_steps=max(args.gradient_accumulation_steps, 1))
+    device = accelerator.device
+    world_size = accelerator.num_processes
+    seed_everything(args.seed + accelerator.process_index)
     torch.backends.cudnn.benchmark = device.type == "cuda"
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
+        torch.backends.cudnn.allow_tf32 = args.allow_tf32
     install_signal_handlers()
 
     logger = None
@@ -148,18 +138,31 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
     optimizer_g = None
     optimizer_d = None
     fixed_noise = None
-    is_rank0 = rank == 0
+    scaler_state = None
+    is_rank0 = accelerator.is_main_process
 
     try:
         if args.image_size != 64:
             raise ValueError("当前 DCGAN 结构固定输出 64x64 图片，请保持 --image-size 64")
         if args.batch_size % world_size != 0:
-            raise ValueError(f"--batch-size {args.batch_size} 不能被 --gpus {world_size} 整除")
+            raise ValueError(f"--batch-size {args.batch_size} 不能被当前进程数 {world_size} 整除")
+        if args.total_kimg <= 0:
+            raise ValueError("--total-kimg 必须为正数")
+        if args.kimg_per_log <= 0:
+            raise ValueError("--kimg-per-log 必须为正数")
+        if args.sample_every_kimg <= 0:
+            raise ValueError("--sample-every-kimg 必须为正数")
+        if args.save_every_kimg <= 0:
+            raise ValueError("--save-every-kimg 必须为正数")
         requested_metrics = parse_metrics(args.metrics) if args.metrics.strip() else []
 
         if is_rank0:
             layout = create_training_layout(args.output_dir, args.tensorboard_dir)
-            runtime_options = {**vars(args), "world_size": world_size}
+            runtime_options = {
+                **vars(args),
+                "world_size": world_size,
+                "mixed_precision_runtime": accelerator.mixed_precision,
+            }
             save_training_options(layout, runtime_options)
             logger = TrainingLogger(layout, enable_tensorboard=not args.no_tensorboard)
             logger.log_config(runtime_options)
@@ -167,27 +170,19 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
             if not args.no_tensorboard:
                 print(f"TensorBoard 日志目录: {layout.tensorboard_dir}")
                 print(f"查看命令: tensorboard --logdir {layout.tensorboard_dir}")
-        barrier()
+        accelerator.wait_for_everyone()
 
         dataset = build_dataset(args.dataset, args.data_root, args.image_size, download=args.download)
         per_rank_batch_size = args.batch_size // world_size
         drop_last = len(dataset) >= args.batch_size
         sampler = None
-        if world_size > 1:
-            sampler = DistributedSampler(
-                dataset,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=True,
-                drop_last=drop_last,
-            )
         dataloader = build_dataloader(
             dataset,
             per_rank_batch_size,
             args.workers,
-            shuffle=sampler is None,
+            shuffle=True,
             drop_last=drop_last,
-            sampler=sampler,
+            sampler=None,
         )
 
         if is_rank0:
@@ -203,23 +198,33 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
                 f"参数量: G={count_parameters(generator):,}, D={count_parameters(discriminator):,}"
             )
 
-        start_epoch = 1
         cur_nimg = 0
+        current_epoch = 1
+        global_step = int(cur_nimg // 1000)
         if args.resume:
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location="cpu")
             generator.load_state_dict(checkpoint["generator"])
             discriminator.load_state_dict(checkpoint["discriminator"])
             optimizer_g.load_state_dict(checkpoint["optimizer_g"])
             optimizer_d.load_state_dict(checkpoint["optimizer_d"])
-            if generator_ema is not None:
-                generator_ema.load_state_dict(checkpoint.get("generator_ema", checkpoint["generator"]))
-            start_epoch = int(checkpoint["epoch"]) + 1
+            scaler_state = checkpoint.get("scaler")
+            if generator_ema is not None and "generator_ema" in checkpoint:
+                generator_ema.load_state_dict(checkpoint["generator_ema"])
+            current_epoch = int(checkpoint.get("epoch", 0)) + 1
             cur_nimg = int(checkpoint.get("cur_nimg", 0))
+            global_step = int(checkpoint.get("global_step", cur_nimg // 1000))
             if is_rank0:
-                print(f"已从 {args.resume} 恢复训练，将从 epoch {start_epoch} 开始")
+                print(f"已从 {args.resume} 恢复训练，将从 nimg={cur_nimg} 继续")
 
-        generator = maybe_wrap_ddp(generator, device, world_size)
-        discriminator = maybe_wrap_ddp(discriminator, device, world_size)
+        generator, discriminator, optimizer_g, optimizer_d, dataloader = accelerator.prepare(
+            generator,
+            discriminator,
+            optimizer_g,
+            optimizer_d,
+            dataloader,
+        )
+        if scaler_state is not None and getattr(accelerator, "scaler", None) is not None:
+            accelerator.scaler.load_state_dict(scaler_state)
 
         fixed_noise = make_noise(min(64, args.batch_size), args.latent_dim, device) if is_rank0 else None
         saved_reals = False
@@ -228,22 +233,21 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
         next_save_nimg = _next_kimg_boundary(cur_nimg, args.save_every_kimg)
         next_eval_nimg = _next_kimg_boundary(cur_nimg, args.eval_every_kimg)
         next_log_nimg = _next_kimg_boundary(cur_nimg, args.kimg_per_log)
+        total_nimg = max(int(round(args.total_kimg * 1000)), 1)
 
         if is_rank0 and fixed_noise is not None:
             with torch.no_grad():
-                init_samples = (generator_ema or unwrap_module(generator)).eval()(fixed_noise)
+                init_model = generator_ema if generator_ema is not None else accelerator.unwrap_model(generator).eval()
+                init_samples = init_model(fixed_noise)
             logger.save_samples(init_samples, layout.sample_dir / "fakes_init.png", global_step=0, nrow=8)
 
-        for epoch in range(start_epoch, args.epochs + 1):
+        while cur_nimg < total_nimg:
             if interrupt_requested():
                 raise KeyboardInterrupt
-            epoch_start = time.time()
-            if sampler is not None:
-                sampler.set_epoch(epoch)
+            current_epoch_start = time.time()
 
-            unwrap_module(generator).train()
-            unwrap_module(discriminator).train()
-            epoch_sums = {"loss_d": 0.0, "loss_g": 0.0, "d_real": 0.0, "d_fake": 0.0}
+            generator.train()
+            discriminator.train()
 
             for step, real_images in enumerate(dataloader, start=1):
                 if interrupt_requested():
@@ -259,25 +263,28 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
                 real_targets = torch.ones(batch_size, device=device)
                 fake_targets = torch.zeros(batch_size, device=device)
 
-                optimizer_d.zero_grad(set_to_none=True)
-                real_scores = discriminator(real_images)
-                loss_d_real = criterion(real_scores, real_targets)
+                with accelerator.accumulate(discriminator):
+                    optimizer_d.zero_grad(set_to_none=True)
+                    with accelerator.autocast():
+                        real_scores = discriminator(real_images)
+                        loss_d_real = criterion(real_scores.float(), real_targets.float())
 
-                noise = make_noise(batch_size, args.latent_dim, device)
-                fake_images = generator(noise)
-                fake_scores = discriminator(fake_images.detach())
-                loss_d_fake = criterion(fake_scores, fake_targets)
+                        noise = make_noise(batch_size, args.latent_dim, device)
+                        fake_images = generator(noise)
+                        fake_scores = discriminator(fake_images.detach())
+                        loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
+                        loss_d = loss_d_real + loss_d_fake
+                    accelerator.backward(loss_d)
+                    optimizer_d.step()
 
-                loss_d = loss_d_real + loss_d_fake
-                loss_d.backward()
-                optimizer_d.step()
-
-                optimizer_g.zero_grad(set_to_none=True)
-                fool_targets = torch.ones(batch_size, device=device)
-                fake_scores_for_g = discriminator(fake_images)
-                loss_g = criterion(fake_scores_for_g, fool_targets)
-                loss_g.backward()
-                optimizer_g.step()
+                with accelerator.accumulate(generator):
+                    optimizer_g.zero_grad(set_to_none=True)
+                    fool_targets = torch.ones(batch_size, device=device)
+                    with accelerator.autocast():
+                        fake_scores_for_g = discriminator(fake_images)
+                        loss_g = criterion(fake_scores_for_g.float(), fool_targets.float())
+                    accelerator.backward(loss_g)
+                    optimizer_g.step()
 
                 if generator_ema is not None:
                     update_ema(generator_ema, generator, args.ema_decay)
@@ -286,11 +293,11 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
                     [
                         loss_d.detach(),
                         loss_g.detach(),
-                        real_scores.detach().mean(),
-                        fake_scores.detach().mean(),
+                        torch.sigmoid(real_scores.detach()).mean(),
+                        torch.sigmoid(fake_scores.detach()).mean(),
                     ]
                 )
-                metric_tensor = average_tensor(metric_tensor, world_size)
+                metric_tensor = accelerator.reduce(metric_tensor, reduction="mean")
                 metrics = {
                     "loss_d": metric_tensor[0].item(),
                     "loss_g": metric_tensor[1].item(),
@@ -298,20 +305,15 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
                     "d_fake": metric_tensor[3].item(),
                 }
                 global_batch_size = batch_size * world_size
-                prev_nimg = cur_nimg
                 cur_nimg += global_batch_size
+                global_step = int(cur_nimg // 1000)
                 cur_kimg = cur_nimg / 1000.0
-
-                for key in epoch_sums:
-                    epoch_sums[key] += metrics[key]
+                reached_end = cur_nimg >= total_nimg
 
                 if is_rank0:
-                    global_step = (epoch - 1) * total_steps + step
                     sec_per_step = time.perf_counter() - step_start
                     images_seen = float(cur_nimg)
                     extras = {
-                        "Progress/epoch": float(epoch),
-                        "Progress/step": float(step),
                         "Progress/images_seen": images_seen,
                         "Progress/nimg": float(cur_nimg),
                         "Progress/kimg": cur_kimg,
@@ -321,16 +323,12 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
                     if device.type == "cuda":
                         extras["Resources/gpu_mem_allocated_gb"] = torch.cuda.memory_allocated(device) / (2**30)
                         extras["Resources/gpu_mem_reserved_gb"] = torch.cuda.memory_reserved(device) / (2**30)
-                    should_log = step == 1 or step == total_steps
-                    if args.kimg_per_log > 0:
-                        if next_log_nimg is not None and cur_nimg >= next_log_nimg:
-                            should_log = True
-                            next_log_nimg = _next_kimg_boundary(cur_nimg, args.kimg_per_log)
-                    elif step % args.log_every == 0:
-                        should_log = True
+                    should_log = reached_end or (next_log_nimg is not None and cur_nimg >= next_log_nimg)
                     if should_log:
+                        if next_log_nimg is not None and cur_nimg >= next_log_nimg:
+                            next_log_nimg = _next_kimg_boundary(cur_nimg, args.kimg_per_log)
                         logger.log_step(
-                            epoch=epoch,
+                            epoch=current_epoch,
                             step=step,
                             total_steps=total_steps,
                             global_step=global_step,
@@ -340,30 +338,21 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
                             extras=extras,
                         )
                         print(
-                            f"Epoch [{epoch}/{args.epochs}] Step [{step}/{total_steps}] "
-                            f"nimg={cur_nimg} kimg={cur_kimg:.3f} "
+                            f"Step [{step}/{total_steps}] nimg={cur_nimg} kimg={cur_kimg:.3f} "
                             f"Loss_D={metrics['loss_d']:.4f} Loss_G={metrics['loss_g']:.4f} "
                             f"D(real)={metrics['d_real']:.4f} D(fake)={metrics['d_fake']:.4f}"
                         )
 
-                    should_sample = False
-                    if args.sample_every_kimg > 0:
-                        if next_sample_nimg is not None and cur_nimg >= next_sample_nimg:
-                            should_sample = True
-                            next_sample_nimg = _next_kimg_boundary(cur_nimg, args.sample_every_kimg)
-                    elif epoch % args.sample_every == 0 and step == total_steps:
-                        should_sample = True
+                    should_sample = reached_end or (next_sample_nimg is not None and cur_nimg >= next_sample_nimg)
+                    if should_sample and next_sample_nimg is not None and cur_nimg >= next_sample_nimg:
+                        next_sample_nimg = _next_kimg_boundary(cur_nimg, args.sample_every_kimg)
 
-                    should_save = False
-                    if args.save_every_kimg > 0:
-                        if next_save_nimg is not None and cur_nimg >= next_save_nimg:
-                            should_save = True
-                            next_save_nimg = _next_kimg_boundary(cur_nimg, args.save_every_kimg)
-                    elif epoch % args.save_every == 0 and step == total_steps:
-                        should_save = True
+                    should_save = reached_end or (next_save_nimg is not None and cur_nimg >= next_save_nimg)
+                    if should_save and next_save_nimg is not None and cur_nimg >= next_save_nimg:
+                        next_save_nimg = _next_kimg_boundary(cur_nimg, args.save_every_kimg)
 
                     if should_sample:
-                        sample_model = generator_ema if generator_ema is not None else unwrap_module(generator).eval()
+                        sample_model = generator_ema if generator_ema is not None else accelerator.unwrap_model(generator).eval()
                         with torch.no_grad():
                             samples = sample_model(fixed_noise)
                         logger.save_samples(
@@ -375,30 +364,32 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
 
                     state = {
                         "model_type": "dcgan",
-                        "epoch": epoch,
+                        "epoch": current_epoch,
                         "cur_nimg": cur_nimg,
-                        "generator": unwrap_module(generator).state_dict(),
-                        "generator_ema": generator_ema.state_dict() if generator_ema is not None else unwrap_module(generator).state_dict(),
-                        "discriminator": unwrap_module(discriminator).state_dict(),
+                        "global_step": global_step,
+                        "generator": accelerator.get_state_dict(generator),
+                        "generator_ema": generator_ema.state_dict() if generator_ema is not None else accelerator.get_state_dict(generator),
+                        "discriminator": accelerator.get_state_dict(discriminator),
                         "optimizer_g": optimizer_g.state_dict(),
                         "optimizer_d": optimizer_d.state_dict(),
+                        "scaler": accelerator.scaler.state_dict() if getattr(accelerator, "scaler", None) is not None else None,
                         "model_args": model_args,
                         "disc_args": disc_args,
                         "train_args": vars(args),
                         "world_size": world_size,
+                        "mixed_precision": accelerator.mixed_precision,
                     }
-                    if should_save or step == total_steps:
-                        torch.save(state, layout.checkpoint_dir / "latest.pt")
                     if should_save:
+                        torch.save(state, layout.checkpoint_dir / "latest.pt")
                         torch.save(state, layout.checkpoint_dir / f"dcgan_nimg_{cur_nimg:08d}.pt")
 
                     should_eval = False
                     if requested_metrics and args.eval_every_kimg > 0:
-                        if next_eval_nimg is not None and cur_nimg >= next_eval_nimg:
-                            should_eval = True
+                        should_eval = reached_end or (next_eval_nimg is not None and cur_nimg >= next_eval_nimg)
+                        if should_eval and next_eval_nimg is not None and cur_nimg >= next_eval_nimg:
                             next_eval_nimg = _next_kimg_boundary(cur_nimg, args.eval_every_kimg)
                     if should_eval:
-                        eval_model = generator_ema if generator_ema is not None else unwrap_module(generator).eval()
+                        eval_model = generator_ema if generator_ema is not None else accelerator.unwrap_model(generator).eval()
                         adapter = AI2602GeneratorAdapter.from_generator(eval_model, z_dim=args.latent_dim, device=device)
                         adapter.eval().requires_grad_(False).to(device)
                         eval_result = evaluate_adapter(
@@ -413,11 +404,14 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
                             for metric_name, values in eval_result["metrics"].items()
                             for key, value in values.items()
                         }
-                        logger.log_epoch(
-                            epoch=epoch,
+                        logger.log_step(
+                            epoch=current_epoch,
+                            step=step,
+                            total_steps=total_steps,
                             global_step=global_step,
-                            metrics={},
-                            elapsed_sec=0.0,
+                            metrics=metrics,
+                            lr_g=optimizer_g.param_groups[0]["lr"],
+                            lr_d=optimizer_d.param_groups[0]["lr"],
                             extras={
                                 "Progress/nimg": float(cur_nimg),
                                 "Progress/kimg": cur_kimg,
@@ -426,21 +420,10 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
                         )
                         print(f"中间评测 @ nimg={cur_nimg}, kimg={cur_kimg:.3f}: {eval_result['metrics']}")
 
-            if is_rank0:
-                epoch_metrics = {key: value / max(total_steps, 1) for key, value in epoch_sums.items()}
-                global_step = epoch * total_steps
-                logger.log_epoch(
-                    epoch=epoch,
-                    global_step=global_step,
-                    metrics=epoch_metrics,
-                    elapsed_sec=time.time() - epoch_start,
-                    extras={
-                        "Progress/images_seen": float(cur_nimg),
-                        "Progress/nimg": float(cur_nimg),
-                        "Progress/kimg": cur_nimg / 1000.0,
-                        "Timing/sec_per_epoch": time.time() - epoch_start,
-                    },
-                )
+                if reached_end:
+                    break
+
+            current_epoch += 1
 
         if is_rank0:
             print("DCGAN 训练完成。")
@@ -448,6 +431,7 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
         if is_rank0:
             print("\n收到中断信号，正在清理训练进程并释放资源...")
     finally:
+        accelerator.wait_for_everyone()
         cleanup_training_process(
             logger=logger,
             dataloader=dataloader,
@@ -468,32 +452,11 @@ def train_worker(rank: int, args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    """单卡直接运行，多卡用 spawn 拉起多个训练进程。"""
+    """通过 accelerate 统一单卡/多卡训练入口。"""
 
     args = parse_args()
     args.output_dir = str(ensure_dir(args.output_dir))
-    if args.gpus > 1:
-        if args.master_port == "":
-            args.master_port = find_free_port()
-        torch.multiprocessing.set_start_method("spawn", force=True)
-        process_context = None
-        try:
-            process_context = torch.multiprocessing.spawn(train_worker, args=(args,), nprocs=args.gpus, join=False)
-            while not process_context.join(timeout=1.0):
-                pass
-        except KeyboardInterrupt:
-            print("\n主进程收到中断，正在停止所有训练子进程...")
-            if process_context is not None:
-                for process in process_context.processes:
-                    if process.is_alive():
-                        process.terminate()
-                for process in process_context.processes:
-                    process.join(timeout=5.0)
-            cleanup_distributed()
-    else:
-        if args.master_port == "":
-            args.master_port = "29500"
-        train_worker(rank=0, args=args)
+    train(args)
 
 
 if __name__ == "__main__":
