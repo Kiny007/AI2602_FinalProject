@@ -113,6 +113,17 @@ def _next_kimg_boundary(cur_nimg: int, interval_kimg: float) -> int | None:
     return ((cur_nimg // interval_nimg) + 1) * interval_nimg
 
 
+def _format_duration(seconds: float) -> str:
+    """把秒数格式化成更适合日志阅读的时长字符串。"""
+
+    total_seconds = max(int(seconds), 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes:d}m {secs:02d}s"
+
+
 def train(args: argparse.Namespace) -> None:
     """使用 accelerate 统一单卡、多卡与混合精度训练。"""
 
@@ -229,6 +240,7 @@ def train(args: argparse.Namespace) -> None:
         fixed_noise = make_noise(min(64, args.batch_size), args.latent_dim, device) if is_rank0 else None
         saved_reals = False
         total_steps = len(dataloader)
+        train_start_time = time.time()
         next_sample_nimg = _next_kimg_boundary(cur_nimg, args.sample_every_kimg)
         next_save_nimg = _next_kimg_boundary(cur_nimg, args.save_every_kimg)
         next_eval_nimg = _next_kimg_boundary(cur_nimg, args.eval_every_kimg)
@@ -312,12 +324,17 @@ def train(args: argparse.Namespace) -> None:
 
                 if is_rank0:
                     sec_per_step = time.perf_counter() - step_start
+                    sec_per_kimg = sec_per_step * 1000.0 / max(global_batch_size, 1)
+                    elapsed_time = time.time() - train_start_time
                     images_seen = float(cur_nimg)
                     extras = {
+                        "Progress/epoch": float(current_epoch),
                         "Progress/images_seen": images_seen,
                         "Progress/nimg": float(cur_nimg),
                         "Progress/kimg": cur_kimg,
+                        "Timing/elapsed_sec": elapsed_time,
                         "Timing/sec_per_step": sec_per_step,
+                        "Timing/sec_per_kimg": sec_per_kimg,
                         "Timing/images_per_sec": global_batch_size / max(sec_per_step, 1e-8),
                     }
                     if device.type == "cuda":
@@ -338,7 +355,9 @@ def train(args: argparse.Namespace) -> None:
                             extras=extras,
                         )
                         print(
-                            f"Step [{step}/{total_steps}] nimg={cur_nimg} kimg={cur_kimg:.3f} "
+                            f"Epoch {current_epoch} Step [{step}/{total_steps}] "
+                            f"kimg={cur_kimg:.3f} time={_format_duration(elapsed_time)} "
+                            f"sec/kimg={sec_per_kimg:.2f} "
                             f"Loss_D={metrics['loss_d']:.4f} Loss_G={metrics['loss_g']:.4f} "
                             f"D(real)={metrics['d_real']:.4f} D(fake)={metrics['d_fake']:.4f}"
                         )
