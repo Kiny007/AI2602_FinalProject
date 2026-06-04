@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 import torch
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from torch import nn, optim
 
 
@@ -127,7 +127,11 @@ def _format_duration(seconds: float) -> str:
 def train(args: argparse.Namespace) -> None:
     """使用 accelerate 统一单卡、多卡与混合精度训练。"""
 
-    accelerator = Accelerator(gradient_accumulation_steps=max(args.gradient_accumulation_steps, 1))
+    ddp_kwargs = DistributedDataParallelKwargs(broadcast_buffers=False)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=max(args.gradient_accumulation_steps, 1),
+        kwargs_handlers=[ddp_kwargs],
+    )
     device = accelerator.device
     world_size = accelerator.num_processes
     seed_everything(args.seed + accelerator.process_index)
@@ -282,8 +286,9 @@ def train(args: argparse.Namespace) -> None:
                         loss_d_real = criterion(real_scores.float(), real_targets.float())
 
                         noise = make_noise(batch_size, args.latent_dim, device)
-                        fake_images = generator(noise)
-                        fake_scores = discriminator(fake_images.detach())
+                        with torch.no_grad():
+                            fake_images_d = generator(noise)
+                        fake_scores = discriminator(fake_images_d)
                         loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
                         loss_d = loss_d_real + loss_d_fake
                     accelerator.backward(loss_d)
@@ -293,7 +298,9 @@ def train(args: argparse.Namespace) -> None:
                     optimizer_g.zero_grad(set_to_none=True)
                     fool_targets = torch.ones(batch_size, device=device)
                     with accelerator.autocast():
-                        fake_scores_for_g = discriminator(fake_images)
+                        noise = make_noise(batch_size, args.latent_dim, device)
+                        fake_images_g = generator(noise)
+                        fake_scores_for_g = discriminator(fake_images_g)
                         loss_g = criterion(fake_scores_for_g.float(), fool_targets.float())
                     accelerator.backward(loss_g)
                     optimizer_g.step()
