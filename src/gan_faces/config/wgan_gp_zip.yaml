@@ -2,7 +2,7 @@
 dataset: folder
 data_root: data/celeba_64.zip
 download: false
-output_dir: outputs/dcgan_acc_zip
+output_dir: outputs/wgan_gp_acc_zip
 batch_size: 128
 image_size: 64
 latent_dim: 100
@@ -11,7 +11,7 @@ discriminator_features: 64
 lr: 0.0002
 beta1: 0.5
 beta2: 0.999
-gan_loss: dcgan
+gan_loss: wgan_gp
 gp_lambda: 10.0
 n_dis: 1
 mixed_precision: fp16
