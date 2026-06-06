@@ -44,6 +44,8 @@ def evaluate_adapter(
     metrics: list[str],
     verbose: bool = True,
     cache: bool = True,
+    num_gpus: int = 1,
+    rank: int = 0,
 ) -> dict[str, Any]:
     data_path = Path(data_path)
     if not data_path.exists():
@@ -65,8 +67,8 @@ def evaluate_adapter(
             metric=metric,
             G=adapter,
             dataset_kwargs=dataset_kwargs,
-            num_gpus=1,
-            rank=0,
+            num_gpus=num_gpus,
+            rank=rank,
             device=next(adapter.parameters()).device,
             progress=progress,
             cache=cache,

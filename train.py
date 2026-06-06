@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-data-root", type=str, default="", help="中间评测使用的真实数据路径，默认与 data-root 相同")
     parser.add_argument("--eval-verbose", action="store_true", help="打印中间评测的详细进度")
     parser.add_argument("--no-eval-cache", action="store_true", help="禁用中间评测的真实特征缓存")
+    parser.add_argument("--ddp-timeout-minutes", type=int, default=180, help="DDP/NCCL sync timeout in minutes; useful when inline metrics are slow")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="生成器 EMA 衰减系数，<=0 时关闭")
     parser.add_argument("--tensorboard-dir", type=str, default="", help="TensorBoard 日志目录，默认 output-dir/tensorboard")
     parser.add_argument("--no-tensorboard", action="store_true", help="关闭 TensorBoard 日志写入")
@@ -161,7 +162,7 @@ def train(args: argparse.Namespace) -> None:
     """使用 accelerate 统一单卡、多卡与混合精度训练。"""
 
     ddp_kwargs = DistributedDataParallelKwargs(broadcast_buffers=False)
-    init_pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=60))
+    init_pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=args.ddp_timeout_minutes))
     accelerator = Accelerator(
         gradient_accumulation_steps=max(args.gradient_accumulation_steps, 1),
         mixed_precision=args.mixed_precision,
@@ -189,6 +190,7 @@ def train(args: argparse.Namespace) -> None:
     optimizer_d = None
     fixed_noise = None
     scaler_state = None
+    generator_ema_state = None
     is_rank0 = accelerator.is_main_process
 
     try:
@@ -206,9 +208,15 @@ def train(args: argparse.Namespace) -> None:
             raise ValueError("--save-every-kimg 必须为正数")
         if args.n_dis <= 0:
             raise ValueError("--n-dis 必须为正整数")
+        if args.ddp_timeout_minutes <= 0:
+            raise ValueError("--ddp-timeout-minutes must be positive")
         if args.gan_loss == "wgan_gp" and args.gp_lambda <= 0:
             raise ValueError("--gp-lambda 必须为正数")
         requested_metrics = parse_metrics(args.metrics) if args.metrics.strip() else []
+        if world_size > 1 and "ndb5k" in requested_metrics:
+            if is_rank0:
+                print("ndb5k inline eval only supports single GPU; skipping ndb5k for multi-GPU training.")
+            requested_metrics = [metric for metric in requested_metrics if metric != "ndb5k"]
 
         if is_rank0:
             layout = create_training_layout(args.output_dir, args.tensorboard_dir)
@@ -246,7 +254,7 @@ def train(args: argparse.Namespace) -> None:
             )
 
         generator, discriminator, criterion, optimizer_g, optimizer_d, model_args, disc_args = build_training_components(args, device)
-        generator_ema = copy.deepcopy(generator).eval() if is_rank0 and args.ema_decay > 0 else None
+        generator_ema = None
         if is_rank0:
             print(
                 f"参数量: G={count_parameters(generator):,}, D={count_parameters(discriminator):,}"
@@ -262,8 +270,7 @@ def train(args: argparse.Namespace) -> None:
             optimizer_g.load_state_dict(checkpoint["optimizer_g"])
             optimizer_d.load_state_dict(checkpoint["optimizer_d"])
             scaler_state = checkpoint.get("scaler")
-            if generator_ema is not None and "generator_ema" in checkpoint:
-                generator_ema.load_state_dict(checkpoint["generator_ema"])
+            generator_ema_state = checkpoint.get("generator_ema")
             current_epoch = int(checkpoint.get("epoch", 0)) + 1
             cur_nimg = int(checkpoint.get("cur_nimg", 0))
             global_step = int(checkpoint.get("global_step", cur_nimg // 1000))
@@ -277,6 +284,10 @@ def train(args: argparse.Namespace) -> None:
             optimizer_d,
             dataloader,
         )
+        if args.ema_decay > 0:
+            generator_ema = copy.deepcopy(accelerator.unwrap_model(generator)).eval().to(device)
+            if generator_ema_state is not None:
+                generator_ema.load_state_dict(generator_ema_state)
         if scaler_state is not None and getattr(accelerator, "scaler", None) is not None:
             accelerator.scaler.load_state_dict(scaler_state)
 
@@ -405,6 +416,11 @@ def train(args: argparse.Namespace) -> None:
                 global_step = int(cur_nimg // 1000)
                 cur_kimg = cur_nimg / 1000.0
                 reached_end = cur_nimg >= total_nimg
+                should_eval = False
+                if requested_metrics and args.eval_every_kimg > 0:
+                    should_eval = reached_end or (next_eval_nimg is not None and cur_nimg >= next_eval_nimg)
+                    if should_eval and next_eval_nimg is not None and cur_nimg >= next_eval_nimg:
+                        next_eval_nimg = _next_kimg_boundary(cur_nimg, args.eval_every_kimg)
 
                 if is_rank0:
                     sec_per_step = time.perf_counter() - step_start
@@ -491,22 +507,25 @@ def train(args: argparse.Namespace) -> None:
                         torch.save(state, layout.checkpoint_dir / "latest.pt")
                         torch.save(state, layout.checkpoint_dir / f"dcgan_nimg_{cur_nimg:08d}.pt")
 
-                    should_eval = False
-                    if requested_metrics and args.eval_every_kimg > 0:
-                        should_eval = reached_end or (next_eval_nimg is not None and cur_nimg >= next_eval_nimg)
-                        if should_eval and next_eval_nimg is not None and cur_nimg >= next_eval_nimg:
-                            next_eval_nimg = _next_kimg_boundary(cur_nimg, args.eval_every_kimg)
-                    if should_eval:
-                        eval_model = generator_ema if generator_ema is not None else accelerator.unwrap_model(generator).eval()
-                        adapter = AI2602GeneratorAdapter.from_generator(eval_model, z_dim=args.latent_dim, device=device)
-                        adapter.eval().requires_grad_(False).to(device)
-                        eval_result = evaluate_adapter(
-                            adapter=adapter,
-                            data_path=args.eval_data_root or args.data_root,
-                            metrics=requested_metrics,
-                            verbose=args.eval_verbose,
-                            cache=not args.no_eval_cache,
-                        )
+
+                if should_eval:
+                    if world_size > 1:
+                        accelerator.wait_for_everyone()
+                    eval_model = generator_ema if generator_ema is not None else accelerator.unwrap_model(generator).eval()
+                    adapter = AI2602GeneratorAdapter.from_generator(eval_model, z_dim=args.latent_dim, device=device)
+                    adapter.eval().requires_grad_(False).to(device)
+                    eval_result = evaluate_adapter(
+                        adapter=adapter,
+                        data_path=args.eval_data_root or args.data_root,
+                        metrics=requested_metrics,
+                        verbose=args.eval_verbose,
+                        cache=not args.no_eval_cache,
+                        num_gpus=world_size,
+                        rank=accelerator.process_index,
+                    )
+                    if generator_ema is None:
+                        accelerator.unwrap_model(generator).train()
+                    if is_rank0:
                         metric_scalars = {
                             f"Metrics/{metric_name}/{key}": float(value)
                             for metric_name, values in eval_result["metrics"].items()
@@ -527,7 +546,8 @@ def train(args: argparse.Namespace) -> None:
                             },
                         )
                         print(f"中间评测 @ nimg={cur_nimg}, kimg={cur_kimg:.3f}: {eval_result['metrics']}")
-
+                    if world_size > 1:
+                        accelerator.wait_for_everyone()
                 if reached_end:
                     break
 
