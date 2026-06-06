@@ -11,17 +11,52 @@ from torch import nn
 from torch.nn.utils import spectral_norm
 
 
-def _maybe_spectral_norm(module: nn.Module, enabled: bool) -> nn.Module:
-
-    return spectral_norm(module) if enabled else module
 
 def norm_act(dim, use_spec_norm: bool):
     if not use_spec_norm:
         return nn.Sequential(nn.BatchNorm2d(dim), nn.LeakyReLU(0.2, inplace=True))
     else:
         return nn.LeakyReLU(0.2, inplace=True)
-        
 
+
+
+        
+class ScaledSpectralNormConv2d(nn.Module):
+    """根据 ABCAS 论文 Fig. 1 设定的动态缩放谱归一化层。"""
+    def __init__(self, conv_layer: nn.Conv2d, scale_provider) -> None:
+        super().__init__()
+        self.conv = spectral_norm(conv_layer)
+        self.scale_provider = scale_provider
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 获取由训练循环动态计算并注入的 m 值
+        m = self.scale_provider()
+        import random
+        if random.random() < 0.01:  # 偶尔打印 m 的值，观察训练过程中 ABCAS 的动态调整效果
+            print(f"ABCAS m: {m:.4f}")
+        # if torch.is_autocast_enabled():
+        #     try:
+        #         # pytorch >2.4
+        #         target_dtype = torch.get_autocast_dtype('cuda')
+        #     except AttributeError:
+        #         # 兼容旧版本的 get_autocast_gpu_dtype
+        #         target_dtype = torch.get_autocast_gpu_dtype()
+        # else:
+        #     # 未开启自动混合精度（纯 FP32 状态）
+        #     target_dtype = x.dtype
+        # scaled_weight = (self.conv.weight * m).to(device=x.device, dtype=target_dtype)
+        # bias = self.conv.bias.to(device=x.device, dtype=target_dtype) if self.conv.bias is not None else None
+        # return F.conv2d(
+        #     x, scaled_weight, bias,
+        #     stride=self.conv.stride,
+        #     padding=self.conv.padding,
+        #     dilation=self.conv.dilation,
+        #     groups=self.conv.groups
+        # )
+        out = self.conv(x)
+        
+        # 对输出乘以 m，在数学上完全等价于对权重 W 和偏置 b 同时乘上 m
+        return out * m
 
 class Generator(nn.Module):
     """DCGAN 生成器：把随机噪声逐步上采样为 64x64 RGB 头像。"""
@@ -64,45 +99,60 @@ class Generator(nn.Module):
 class Discriminator(nn.Module):
     """DCGAN 判别器：判断输入头像来自真实数据还是生成器。"""
 
-    def __init__(self, image_channels: int = 3, feature_maps: int = 64, use_spectral_norm: bool = False) -> None:
+    def __init__(self, image_channels: int = 3, feature_maps: int = 64, use_spectral_norm: bool = False, scale_sn: bool = False) -> None:
         super().__init__()
         ndf = feature_maps
+        self.current_scale = 1.0
+        scale_fn = lambda: self.current_scale
+        bias_enabled = use_spectral_norm
+        def _maybe_abcas_sn(module: nn.Conv2d, sn: bool, scale: bool) -> nn.Module:
+            if sn and scale:
+                return ScaledSpectralNormConv2d(module, scale_fn)
+            elif sn:
+                return spectral_norm(module)
+            else:
+                return module
 
         self.net = nn.Sequential(
             # 输入: N x 3 x 64 x 64
-            _maybe_spectral_norm(
-                nn.Conv2d(image_channels, ndf, kernel_size=4, stride=2, padding=1, bias=False),
+            _maybe_abcas_sn(
+                nn.Conv2d(image_channels, ndf, kernel_size=4, stride=2, padding=1, bias=bias_enabled),
                 use_spectral_norm,
+                scale_sn,
             ),
             nn.LeakyReLU(0.2, inplace=True),
             # N x ndf x 32 x 32
-            _maybe_spectral_norm(
-                nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2, padding=1, bias=False),
+            _maybe_abcas_sn(
+                nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2, padding=1, bias=bias_enabled),
                 use_spectral_norm,
+                scale_sn,
             ),
             norm_act(ndf * 2, use_spectral_norm),
             # nn.BatchNorm2d(ndf * 2),
             # nn.LeakyReLU(0.2, inplace=True),
             # N x (ndf*2) x 16 x 16
-            _maybe_spectral_norm(
-                nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2, padding=1, bias=False),
+            _maybe_abcas_sn(
+                nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2, padding=1, bias=bias_enabled),
                 use_spectral_norm,
+                scale_sn,
             ),
             norm_act(ndf * 4, use_spectral_norm),
             # nn.BatchNorm2d(ndf * 4),
             # nn.LeakyReLU(0.2, inplace=True),
             # N x (ndf*4) x 8 x 8
-            _maybe_spectral_norm(
-                nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=2, padding=1, bias=False),
+            _maybe_abcas_sn(
+                nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=2, padding=1, bias=bias_enabled),
                 use_spectral_norm,
+                scale_sn,
             ),
             norm_act(ndf * 8, use_spectral_norm),
             # nn.BatchNorm2d(ndf * 8),
             # nn.LeakyReLU(0.2, inplace=True),
             # N x (ndf*8) x 4 x 4
-            _maybe_spectral_norm(
-                nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1, padding=0, bias=False),
+            _maybe_abcas_sn(
+                nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1, padding=0, bias=bias_enabled),
                 use_spectral_norm,
+                scale_sn,
             ),
             # 输出真假 logits，训练时配合 BCEWithLogitsLoss，兼容 mixed precision。
         )
@@ -113,104 +163,6 @@ class Discriminator(nn.Module):
         return self.net(image).view(-1)
 
 
-class CycleResidualBlock(nn.Module):
-    """CycleGAN 生成器中的残差块，保持特征图尺寸不变。"""
-
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=0, bias=False),
-            nn.InstanceNorm2d(channels, affine=True),
-            nn.ReLU(inplace=True),
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=0, bias=False),
-            nn.InstanceNorm2d(channels, affine=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """返回残差连接后的特征图，用于增强 CycleGAN 生成器表达能力。"""
-
-        return x + self.block(x)
-
-
-class CycleGenerator(nn.Module):
-    """CycleGAN 的 ResNet 生成器，用于无配对图像域转换。
-
-    输入和输出都是 64x64 RGB 图像，像素范围为 [-1, 1]。与 DCGAN 不同，
-    CycleGAN 生成器不是从噪声采样，而是把源域图片翻译到目标域。
-    """
-
-    def __init__(
-        self,
-        image_channels: int = 3,
-        feature_maps: int = 64,
-        num_residual_blocks: int = 6,
-    ) -> None:
-        super().__init__()
-        ngf = feature_maps
-
-        layers: list[nn.Module] = [
-            nn.ReflectionPad2d(3),
-            nn.Conv2d(image_channels, ngf, kernel_size=7, stride=1, padding=0, bias=False),
-            nn.InstanceNorm2d(ngf, affine=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(ngf, ngf * 2, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.InstanceNorm2d(ngf * 2, affine=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(ngf * 2, ngf * 4, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.InstanceNorm2d(ngf * 4, affine=True),
-            nn.ReLU(inplace=True),
-        ]
-
-        layers.extend(CycleResidualBlock(ngf * 4) for _ in range(num_residual_blocks))
-        layers.extend(
-            [
-                nn.ConvTranspose2d(ngf * 4, ngf * 2, kernel_size=4, stride=2, padding=1, bias=False),
-                nn.InstanceNorm2d(ngf * 2, affine=True),
-                nn.ReLU(inplace=True),
-                nn.ConvTranspose2d(ngf * 2, ngf, kernel_size=4, stride=2, padding=1, bias=False),
-                nn.InstanceNorm2d(ngf, affine=True),
-                nn.ReLU(inplace=True),
-                nn.ReflectionPad2d(3),
-                nn.Conv2d(ngf, image_channels, kernel_size=7, stride=1, padding=0),
-                nn.Tanh(),
-            ]
-        )
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
-        """把源域图片翻译为目标域图片，输出范围仍为 [-1, 1]。"""
-
-        return self.net(image)
-
-
-class PatchDiscriminator(nn.Module):
-    """CycleGAN 使用的 PatchGAN 判别器，输出局部 patch 的真假 logits。"""
-
-    def __init__(self, image_channels: int = 3, feature_maps: int = 64) -> None:
-        super().__init__()
-        ndf = feature_maps
-
-        self.net = nn.Sequential(
-            nn.Conv2d(image_channels, ndf, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.InstanceNorm2d(ndf * 2, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.InstanceNorm2d(ndf * 4, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=1, padding=1, bias=False),
-            nn.InstanceNorm2d(ndf * 8, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1, padding=1),
-        )
-
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
-        """输出 patch 级别的真假 logits，而不是单个全图真假分数。"""
-
-        return self.net(image)
 
 
 class PixelNorm(nn.Module):
@@ -222,161 +174,16 @@ class PixelNorm(nn.Module):
         return x * torch.rsqrt(torch.mean(x.pow(2), dim=1, keepdim=True) + 1e-8)
 
 
-class MappingNetwork(nn.Module):
-    """StyleGAN 的映射网络：把 z 空间映射到更适合控制风格的 w 空间。"""
-
-    def __init__(self, latent_dim: int = 100, style_dim: int = 128, layers: int = 4) -> None:
-        super().__init__()
-        modules: list[nn.Module] = [PixelNorm()]
-        in_features = latent_dim
-
-        for _ in range(layers):
-            modules.extend(
-                [
-                    nn.Linear(in_features, style_dim),
-                    nn.LeakyReLU(0.2, inplace=True),
-                ]
-            )
-            in_features = style_dim
-
-        self.net = nn.Sequential(*modules)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """把原始随机噪声 z 映射到 StyleGAN 使用的风格向量 w。"""
-
-        if z.ndim == 4:
-            z = z.flatten(1)
-        return self.net(z)
-
-
-class NoiseInjection(nn.Module):
-    """给特征图加入逐像素噪声，用于模拟 StyleGAN 中的随机细节变化。"""
-
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(1, channels, 1, 1))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """给每个样本、每个空间位置注入可学习强度的随机噪声。"""
-
-        noise = torch.randn(x.size(0), 1, x.size(2), x.size(3), device=x.device, dtype=x.dtype)
-        return x + self.weight * noise
-
-
-class AdaptiveInstanceNorm(nn.Module):
-    """AdaIN：用风格向量控制每个通道的缩放和平移。"""
-
-    def __init__(self, channels: int, style_dim: int) -> None:
-        super().__init__()
-        self.norm = nn.InstanceNorm2d(channels, affine=False, eps=1e-8)
-        self.style = nn.Linear(style_dim, channels * 2)
-        nn.init.normal_(self.style.weight, 0.0, 0.02)
-        nn.init.zeros_(self.style.bias)
-
-    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
-        """根据 style 向量生成通道缩放和平移参数，并调制输入特征。"""
-
-        style_params = self.style(style).view(style.size(0), 2, x.size(1), 1, 1)
-        gamma = style_params[:, 0] + 1.0
-        beta = style_params[:, 1]
-        return gamma * self.norm(x) + beta
-
-
-class StyledConvBlock(nn.Module):
-    """StyleGAN 风格卷积块：上采样、卷积、噪声注入、AdaIN。"""
-
-    def __init__(self, in_channels: int, out_channels: int, style_dim: int, upsample: bool) -> None:
-        super().__init__()
-        self.upsample = upsample
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        self.noise = NoiseInjection(out_channels)
-        self.adain = AdaptiveInstanceNorm(out_channels, style_dim)
-        self.activation = nn.LeakyReLU(0.2, inplace=True)
-
-    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
-        """执行可选上采样、卷积、噪声注入和 AdaIN 风格调制。"""
-
-        if self.upsample:
-            x = F.interpolate(x, scale_factor=2, mode="nearest")
-        x = self.conv(x)
-        x = self.noise(x)
-        x = self.adain(x, style)
-        return self.activation(x)
-
-
-class StyleGeneratorLite(nn.Module):
-    """轻量 StyleGAN 风格生成器，用于 Bonus 中与 DCGAN 做性能对比。
-
-    该实现保留 StyleGAN 的关键思想：映射网络、学习常量输入、AdaIN 风格调制和噪声注入。
-    为了适合课程项目和 64x64 CelebA 实验，这里没有实现完整 StyleGAN/StyleGAN2 的所有技巧。
-    """
-
-    def __init__(
-        self,
-        latent_dim: int = 100,
-        image_channels: int = 3,
-        feature_maps: int = 64,
-        style_dim: int = 128,
-        mapping_layers: int = 4,
-    ) -> None:
-        super().__init__()
-        ngf = feature_maps
-        channels = [ngf * 8, ngf * 8, ngf * 4, ngf * 2, ngf]
-
-        self.mapping = MappingNetwork(latent_dim, style_dim, mapping_layers)
-        self.constant = nn.Parameter(torch.randn(1, channels[0], 4, 4))
-        self.blocks = nn.ModuleList(
-            [
-                StyledConvBlock(channels[0], channels[0], style_dim, upsample=False),
-                StyledConvBlock(channels[0], channels[1], style_dim, upsample=True),
-                StyledConvBlock(channels[1], channels[2], style_dim, upsample=True),
-                StyledConvBlock(channels[2], channels[3], style_dim, upsample=True),
-                StyledConvBlock(channels[3], channels[4], style_dim, upsample=True),
-            ]
-        )
-        self.to_rgb = nn.Sequential(
-            nn.Conv2d(channels[4], image_channels, kernel_size=1),
-            nn.Tanh(),
-        )
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """从噪声生成头像图片，内部先映射风格向量再逐层调制特征。"""
-
-        style = self.mapping(z)
-        x = self.constant.repeat(z.size(0), 1, 1, 1)
-        for block in self.blocks:
-            x = block(x, style)
-        return self.to_rgb(x)
-
 
 def init_dcgan_weights(module: nn.Module) -> None:
     """DCGAN 论文推荐的初始化方式。"""
 
-    classname = module.__class__.__name__
-    if classname.find("Conv") != -1:
+    if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
         weight = module.weight_orig if hasattr(module, "weight_orig") else module.weight
         nn.init.normal_(weight.data, 0.0, 0.02)
-    elif classname.find("BatchNorm") != -1:
+        if module.bias is not None:
+            nn.init.zeros_(module.bias.data)
+            
+    elif isinstance(module, nn.BatchNorm2d):
         nn.init.normal_(module.weight.data, 1.0, 0.02)
         nn.init.constant_(module.bias.data, 0.0)
-
-
-def init_stylegan_lite_weights(module: nn.Module) -> None:
-    """轻量 StyleGAN 生成器的卷积/线性层初始化。"""
-
-    if isinstance(module, (nn.Conv2d, nn.Linear)):
-        nn.init.normal_(module.weight.data, 0.0, 0.02)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias.data)
-
-
-def init_cyclegan_weights(module: nn.Module) -> None:
-    """CycleGAN 论文常用的卷积/归一化层初始化。"""
-
-    if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
-        nn.init.normal_(module.weight.data, 0.0, 0.02)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias.data)
-    elif isinstance(module, nn.InstanceNorm2d) and module.affine:
-        nn.init.normal_(module.weight.data, 1.0, 0.02)
-        nn.init.zeros_(module.bias.data)

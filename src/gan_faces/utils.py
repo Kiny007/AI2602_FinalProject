@@ -14,8 +14,7 @@ import torch
 from torch import nn
 from torchvision.utils import save_image
 
-from .models import CycleGenerator, Generator, StyleGeneratorLite
-
+from .models import Generator
 
 def ensure_dir(path: Union[str, Path]) -> Path:
     """确保目录存在，并返回 Path 对象。"""
@@ -69,10 +68,10 @@ def build_generator(model_type: str, model_args: dict[str, Any]) -> nn.Module:
 
     if model_type == "dcgan":
         return Generator(**model_args)
-    if model_type == "stylegan_lite":
-        return StyleGeneratorLite(**model_args)
-    if model_type in {"cyclegan_a2b", "cyclegan_b2a"}:
-        return CycleGenerator(**model_args)
+    # if model_type == "stylegan_lite":
+    #     return StyleGeneratorLite(**model_args)
+    # if model_type in {"cyclegan_a2b", "cyclegan_b2a"}:
+    #     return CycleGenerator(**model_args)
     raise ValueError(f"未知生成器类型: {model_type}")
 
 

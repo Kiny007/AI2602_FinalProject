@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generator-features", type=int, default=64)
     parser.add_argument("--discriminator-features", type=int, default=64)
     parser.add_argument("--spectral-norm", type=_str2bool, default=False, help="是否为 DCGAN 判别器卷积层启用谱归一化，传 true/false")
+    parser.add_argument("--scale-sn", type=_str2bool, default=False, help="是否启用谱归一化的缩放版本，传 true/false；启用后会在每个 SN 层前额外乘一个可学习的标量参数，初始值为 1.0")
     parser.add_argument("--lr_g", type=float, default=2e-4)
     parser.add_argument("--lr_d", type=float, default=2e-4)
     parser.add_argument("--beta1", type=float, default=0.5)
@@ -81,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-every-kimg", type=float, default=1.0, help="每隔多少 kimg 保存一次样例图")
     parser.add_argument("--save-every-kimg", type=float, default=5.0, help="每隔多少 kimg 保存一次 checkpoint")
     parser.add_argument("--eval-every-kimg", type=float, default=0.0, help="每隔多少 kimg 做一次中间评测，<=0 时关闭")
+    parser.add_argument("--lr-decay-start-kimg", type=float, default=0.0, help="超过该 kimg 后对 G/D 学习率做线性衰减，<=0 表示关闭")
     parser.add_argument("--metrics", type=str, default="", help="中间评测指标，逗号分隔，如 fid5k,is5k；为空则关闭")
     parser.add_argument("--eval-data-root", type=str, default="", help="中间评测使用的真实数据路径，默认与 data-root 相同")
     parser.add_argument("--eval-verbose", action="store_true", help="打印中间评测的详细进度")
@@ -109,6 +111,7 @@ def build_training_components(args: argparse.Namespace, device: torch.device):
         "image_channels": 3,
         "feature_maps": args.discriminator_features,
         "use_spectral_norm": args.spectral_norm,
+        "scale_sn": args.scale_sn,
     }
     generator = Generator(**model_args).to(device)
     discriminator = Discriminator(**disc_args).to(device)
@@ -147,6 +150,46 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes:d}m {secs:02d}s"
 
 
+class LinearKimgLRScheduler:
+    """按 kimg 驱动的线性学习率衰减调度器。"""
+
+    def __init__(self, optimizer: optim.Optimizer, start_kimg: float, total_kimg: float) -> None:
+        self.optimizer = optimizer
+        self.start_kimg = float(start_kimg)
+        self.total_kimg = float(total_kimg)
+        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+        self.last_kimg = 0.0
+
+    def _lr_scale(self, current_kimg: float) -> float:
+        if self.start_kimg <= 0 or self.start_kimg >= self.total_kimg:
+            return 1.0
+        if current_kimg <= self.start_kimg:
+            return 1.0
+        progress = min(max((current_kimg - self.start_kimg) / max(self.total_kimg - self.start_kimg, 1e-8), 0.0), 1.0)
+        return 1.0 - progress
+
+    def step(self, current_kimg: float) -> None:
+        self.last_kimg = float(current_kimg)
+        scale = self._lr_scale(self.last_kimg)
+        for base_lr, group in zip(self.base_lrs, self.optimizer.param_groups):
+            group["lr"] = base_lr * scale
+
+    def state_dict(self) -> dict:
+        return {
+            "start_kimg": self.start_kimg,
+            "total_kimg": self.total_kimg,
+            "base_lrs": list(self.base_lrs),
+            "last_kimg": self.last_kimg,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.start_kimg = float(state_dict.get("start_kimg", self.start_kimg))
+        self.total_kimg = float(state_dict.get("total_kimg", self.total_kimg))
+        self.base_lrs = list(state_dict.get("base_lrs", self.base_lrs))
+        self.last_kimg = float(state_dict.get("last_kimg", 0.0))
+        self.step(self.last_kimg)
+
+
 def train(args: argparse.Namespace) -> None:
     """使用 accelerate 统一单卡、多卡与混合精度训练。"""
 
@@ -175,8 +218,15 @@ def train(args: argparse.Namespace) -> None:
     criterion = None
     optimizer_g = None
     optimizer_d = None
+    scheduler_g = None
+    scheduler_d = None
     fixed_noise = None
     scaler_state = None
+    abcas_dm = 0.0
+    abcas_r = 0.0
+    abcas_m = 1.0
+    abcas_alpha = 0.9999
+    abcas_beta = 4.0
     is_rank0 = accelerator.is_main_process
 
     try:
@@ -192,6 +242,8 @@ def train(args: argparse.Namespace) -> None:
             raise ValueError("--sample-every-kimg 必须为正数")
         if args.save_every_kimg <= 0:
             raise ValueError("--save-every-kimg 必须为正数")
+        if args.lr_decay_start_kimg < 0:
+            raise ValueError("--lr-decay-start-kimg 不能小于 0")
         requested_metrics = parse_metrics(args.metrics) if args.metrics.strip() else []
 
         if is_rank0:
@@ -230,6 +282,8 @@ def train(args: argparse.Namespace) -> None:
             )
 
         generator, discriminator, criterion, optimizer_g, optimizer_d, model_args, disc_args = build_training_components(args, device)
+        scheduler_g = LinearKimgLRScheduler(optimizer_g, args.lr_decay_start_kimg, args.total_kimg)
+        scheduler_d = LinearKimgLRScheduler(optimizer_d, args.lr_decay_start_kimg, args.total_kimg)
         generator_ema = copy.deepcopy(generator).eval() if is_rank0 and args.ema_decay > 0 else None
         if is_rank0:
             print(
@@ -245,12 +299,25 @@ def train(args: argparse.Namespace) -> None:
             discriminator.load_state_dict(checkpoint["discriminator"])
             optimizer_g.load_state_dict(checkpoint["optimizer_g"])
             optimizer_d.load_state_dict(checkpoint["optimizer_d"])
+            if "scheduler_g" in checkpoint:
+                scheduler_g.load_state_dict(checkpoint["scheduler_g"])
+            if "scheduler_d" in checkpoint:
+                scheduler_d.load_state_dict(checkpoint["scheduler_d"])
             scaler_state = checkpoint.get("scaler")
             if generator_ema is not None and "generator_ema" in checkpoint:
                 generator_ema.load_state_dict(checkpoint["generator_ema"])
             current_epoch = int(checkpoint.get("epoch", 0)) + 1
             cur_nimg = int(checkpoint.get("cur_nimg", 0))
             global_step = int(checkpoint.get("global_step", cur_nimg // 1000))
+            abcas_state = checkpoint.get("abcas_state")
+            if abcas_state is not None:
+                abcas_dm = float(abcas_state.get("dm", abcas_dm))
+                abcas_r = float(abcas_state.get("r", abcas_r))
+                abcas_m = float(abcas_state.get("m", abcas_m))
+                abcas_alpha = float(abcas_state.get("alpha", abcas_alpha))
+                abcas_beta = float(abcas_state.get("beta", abcas_beta))
+                if hasattr(discriminator, "current_scale"):
+                    discriminator.current_scale = abcas_m
             if is_rank0:
                 print(f"已从 {args.resume} 恢复训练，将从 nimg={cur_nimg} 继续")
 
@@ -263,6 +330,10 @@ def train(args: argparse.Namespace) -> None:
         )
         if scaler_state is not None and getattr(accelerator, "scaler", None) is not None:
             accelerator.scaler.load_state_dict(scaler_state)
+        if args.spectral_norm and args.scale_sn:
+            unwrapped_d = accelerator.unwrap_model(discriminator)
+            if hasattr(unwrapped_d, "current_scale"):
+                unwrapped_d.current_scale = abcas_m
 
         fixed_noise = make_noise(min(64, args.batch_size), args.latent_dim, device) if is_rank0 else None
         saved_reals = False
@@ -273,6 +344,8 @@ def train(args: argparse.Namespace) -> None:
         next_eval_nimg = _next_kimg_boundary(cur_nimg, args.eval_every_kimg)
         next_log_nimg = _next_kimg_boundary(cur_nimg, args.kimg_per_log)
         total_nimg = max(int(round(args.total_kimg * 1000)), 1)
+        scheduler_g.step(cur_nimg / 1000.0)
+        scheduler_d.step(cur_nimg / 1000.0)
 
         if is_rank0 and fixed_noise is not None:
             with torch.no_grad():
@@ -320,6 +393,21 @@ def train(args: argparse.Namespace) -> None:
                         else:
                             loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
                         loss_d = loss_d_real + loss_d_fake
+                    if args.spectral_norm and args.scale_sn:
+                        with torch.no_grad():
+                            # local_dist = torch.max(real_scores) - torch.min(fake_scores)
+                            local_dist = torch.max(torch.sigmoid(real_scores)) - torch.min(torch.sigmoid(fake_scores))
+                            global_dist = accelerator.reduce(local_dist, reduction="mean").item()
+                            abcas_dm = abcas_alpha * abcas_dm + (1.0 - abcas_alpha) * global_dist
+                            clbr_dm = min(0.999, max(0.0, abcas_dm / abcas_beta))
+                            abcas_r = max(0.0, clbr_dm / (1.0 - clbr_dm))
+                            abcas_m = 0.9 ** abcas_r
+                            unwrapped_d = accelerator.unwrap_model(discriminator)
+                            import random
+                            if random.random() < 0.1:  # 1% 的训练步骤打印一次 ABCAS 调整信息，避免日志过于冗长
+                                print(f"ABCAS 调整: local_dist={local_dist.item():.4f}, global_dist={global_dist:.4f}, dm={abcas_dm:.4f}, r={abcas_r:.4f}, m={abcas_m:.4f}")
+                            if hasattr(unwrapped_d, 'current_scale'):
+                                unwrapped_d.current_scale = abcas_m
                     accelerator.backward(loss_d)
                     optimizer_d.step()
 
@@ -359,6 +447,8 @@ def train(args: argparse.Namespace) -> None:
                 cur_nimg += global_batch_size
                 global_step = int(cur_nimg // 1000)
                 cur_kimg = cur_nimg / 1000.0
+                scheduler_g.step(cur_kimg)
+                scheduler_d.step(cur_kimg)
                 reached_end = cur_nimg >= total_nimg
 
                 if is_rank0:
@@ -376,6 +466,14 @@ def train(args: argparse.Namespace) -> None:
                         "Timing/sec_per_kimg": sec_per_kimg,
                         "Timing/images_per_sec": global_batch_size / max(sec_per_step, 1e-8),
                     }
+                    if args.spectral_norm and args.scale_sn:
+                        extras.update(
+                            {
+                                "ABCAS/m": float(abcas_m),
+                                "ABCAS/dm": float(abcas_dm),
+                                "ABCAS/r": float(abcas_r),
+                            }
+                        )
                     if device.type == "cuda":
                         extras["Resources/gpu_mem_allocated_gb"] = torch.cuda.memory_allocated(device) / (2**30)
                         extras["Resources/gpu_mem_reserved_gb"] = torch.cuda.memory_reserved(device) / (2**30)
@@ -430,6 +528,15 @@ def train(args: argparse.Namespace) -> None:
                         "discriminator": accelerator.get_state_dict(discriminator),
                         "optimizer_g": optimizer_g.state_dict(),
                         "optimizer_d": optimizer_d.state_dict(),
+                        "scheduler_g": scheduler_g.state_dict(),
+                        "scheduler_d": scheduler_d.state_dict(),
+                        "abcas_state": {
+                            "dm": float(abcas_dm),
+                            "r": float(abcas_r),
+                            "m": float(abcas_m),
+                            "alpha": float(abcas_alpha),
+                            "beta": float(abcas_beta),
+                        },
                         "scaler": accelerator.scaler.state_dict() if getattr(accelerator, "scaler", None) is not None else None,
                         "model_args": model_args,
                         "disc_args": disc_args,
@@ -501,6 +608,8 @@ def train(args: argparse.Namespace) -> None:
                 criterion,
                 optimizer_g,
                 optimizer_d,
+                scheduler_g,
+                scheduler_d,
                 fixed_noise,
                 sampler,
                 dataset,
