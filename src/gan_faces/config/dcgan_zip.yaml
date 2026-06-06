@@ -1,7 +1,8 @@
 dataset: folder
 data_root: data/celeba_64.zip
 download: false
-output_dir: outputs/dcgan_acc_zip
+# 单独输出目录，避免覆盖普通 DCGAN baseline。
+output_dir: outputs/unrolled_dcgan_acc_zip
 batch_size: 128
 image_size: 64
 latent_dim: 100
@@ -9,6 +10,10 @@ generator_features: 64
 discriminator_features: 64
 lr: 0.0002
 beta1: 0.5
+# DCGAN 原论文节奏：D 更新 1 次，G 更新 1 次。
+n_dis: 1
+# Unrolled GAN 展开步数；设为 0 即退化为普通 DCGAN 训练。
+unroll_steps: 5
 workers: 0
 kimg_per_log: 0.5
 total_kimg: 5000.0
@@ -25,4 +30,6 @@ no_tensorboard: false
 resume: ""
 seed: 42
 gradient_accumulation_steps: 1
+# 通过 accelerate 使用 fp16 混合精度。
+mixed_precision: fp16
 allow_tf32: false

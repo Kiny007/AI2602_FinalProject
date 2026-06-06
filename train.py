@@ -10,6 +10,7 @@ import argparse
 import copy
 import sys
 import time
+from collections import OrderedDict
 from datetime import timedelta
 from pathlib import Path
 
@@ -17,6 +18,12 @@ import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import InitProcessGroupKwargs
 from torch import nn, optim
+
+# Unrolled GAN 需要函数式调用判别器，以便临时更新 D 的参数而不改动真实模型。
+try:
+    from torch.func import functional_call
+except ImportError:  # pragma: no cover - compatibility with older torch.
+    from torch.nn.utils.stateless import functional_call
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -62,6 +69,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discriminator-features", type=int, default=64)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--beta1", type=float, default=0.5)
+    # Unrolled GAN 相关开关：n_dis=1 保持 DCGAN 的 1:1 更新节奏；
+    # unroll_steps>0 时，G 会基于可微分展开后的 D 来更新。
+    parser.add_argument("--n-dis", type=int, default=1, help="Discriminator updates per generator update")
+    parser.add_argument("--unroll-steps", type=int, default=0, help="Differentiable discriminator steps for Unrolled GAN; 0 keeps vanilla DCGAN")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--total-kimg", type=float, default=1000.0, help="总训练长度，单位 kimg")
     parser.add_argument("--kimg-per-log", type=float, default=0.5, help="每隔多少 kimg 打一次日志")
@@ -78,6 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    # 将 fp16 作为脚本默认混合精度，避免完全依赖外部 accelerate 配置。
+    parser.add_argument("--mixed-precision", choices=["no", "fp16", "bf16"], default="fp16", help="accelerate mixed precision mode")
     parser.add_argument("--allow-tf32", action="store_true", help="允许 CUDA matmul/conv 使用 TF32 提升吞吐")
     apply_config_defaults(parser, load_yaml_config(config_args.config))
     return parser.parse_args(remaining_argv)
@@ -104,6 +117,161 @@ def build_training_components(args: argparse.Namespace, device: torch.device):
     optimizer_g = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
     optimizer_d = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
     return generator, discriminator, criterion, optimizer_g, optimizer_d, model_args, disc_args
+
+
+def _optimizer_core(optimizer):
+    """取出 accelerate 包装前的 torch optimizer。"""
+
+    return getattr(optimizer, "optimizer", optimizer)
+
+
+def _state_step_value(raw_step) -> float:
+    """把 Adam step 计数统一成 Python float，便于可微分展开计算。"""
+
+    if raw_step is None:
+        return 0.0
+    if torch.is_tensor(raw_step):
+        return float(raw_step.detach().item())
+    return float(raw_step)
+
+
+def _prepare_unrolled_adam_state(param_items, optimizer):
+    """复制 Adam 状态，让临时 D 更新贴近真实训练但不污染 optimizer。"""
+
+    optimizer_core = _optimizer_core(optimizer)
+    param_groups = optimizer_core.param_groups
+    state_store = optimizer_core.state
+    default_group = param_groups[0]
+    group_by_param = {
+        id(param): group
+        for group in param_groups
+        for param in group["params"]
+    }
+    unrolled_state = {}
+    for name, param in param_items:
+        group = group_by_param.get(id(param), default_group)
+        state = state_store.get(param, {})
+        exp_avg = state.get("exp_avg")
+        exp_avg_sq = state.get("exp_avg_sq")
+        max_exp_avg_sq = state.get("max_exp_avg_sq")
+        unrolled_state[name] = {
+            "group": group,
+            "step": _state_step_value(state.get("step")),
+            "exp_avg": (
+                torch.zeros_like(param, memory_format=torch.preserve_format)
+                if exp_avg is None
+                else exp_avg.detach().to(device=param.device, dtype=param.dtype)
+            ),
+            "exp_avg_sq": (
+                torch.zeros_like(param, memory_format=torch.preserve_format)
+                if exp_avg_sq is None
+                else exp_avg_sq.detach().to(device=param.device, dtype=param.dtype)
+            ),
+            "max_exp_avg_sq": (
+                None
+                if max_exp_avg_sq is None
+                else max_exp_avg_sq.detach().to(device=param.device, dtype=param.dtype)
+            ),
+        }
+    return unrolled_state
+
+
+def _adam_unroll_step(params, grads, unrolled_state):
+    """对临时判别器参数执行一步可微分 Adam 更新。"""
+
+    next_params = OrderedDict()
+    next_state = {}
+    for (name, param), grad in zip(params.items(), grads):
+        state = unrolled_state[name]
+        group = state["group"]
+        beta1, beta2 = group["betas"]
+        step = state["step"] + 1.0
+        if grad is None:
+            grad = torch.zeros_like(param, memory_format=torch.preserve_format)
+        if group.get("maximize", False):
+            grad = -grad
+        weight_decay = group.get("weight_decay", 0.0)
+        if weight_decay != 0:
+            grad = grad.add(param, alpha=weight_decay)
+
+        exp_avg = state["exp_avg"] * beta1 + grad * (1.0 - beta1)
+        exp_avg_sq = state["exp_avg_sq"] * beta2 + grad.square() * (1.0 - beta2)
+        if group.get("amsgrad", False):
+            prev_max = state["max_exp_avg_sq"]
+            if prev_max is None:
+                prev_max = torch.zeros_like(param, memory_format=torch.preserve_format)
+            max_exp_avg_sq = torch.maximum(prev_max, exp_avg_sq)
+            denom_source = max_exp_avg_sq
+        else:
+            max_exp_avg_sq = state["max_exp_avg_sq"]
+            denom_source = exp_avg_sq
+
+        bias_correction1 = 1.0 - beta1**step
+        bias_correction2 = 1.0 - beta2**step
+        step_size = group["lr"] / bias_correction1
+        denom = denom_source.sqrt() / (bias_correction2**0.5)
+        denom = denom.add(group.get("eps", 1e-8))
+        next_params[name] = param.addcdiv(exp_avg, denom, value=-step_size)
+        next_state[name] = {
+            "group": group,
+            "step": step,
+            "exp_avg": exp_avg,
+            "exp_avg_sq": exp_avg_sq,
+            "max_exp_avg_sq": max_exp_avg_sq,
+        }
+    return next_params, next_state
+
+
+def _functional_discriminator(discriminator, params, buffers, images):
+    """用临时参数和复制的 buffer 运行判别器。"""
+
+    state = OrderedDict(params)
+    state.update(buffers)
+    return functional_call(discriminator, state, (images,))
+
+
+def _unrolled_generator_loss(
+    generator,
+    discriminator,
+    criterion,
+    optimizer_d,
+    real_images,
+    latent_dim: int,
+    device: torch.device,
+    unroll_steps: int,
+    real_targets,
+    fake_targets,
+    fool_targets,
+):
+    """模拟若干步 D 更新后，再计算生成器损失。"""
+
+    param_items = tuple(discriminator.named_parameters())
+    params = OrderedDict(param_items)
+    buffers = OrderedDict(
+        (name, buffer.detach().clone())
+        for name, buffer in discriminator.named_buffers()
+    )
+    unrolled_state = _prepare_unrolled_adam_state(param_items, optimizer_d)
+
+    noise = make_noise(real_images.size(0), latent_dim, device)
+    fake_images = generator(noise)
+    for _ in range(unroll_steps):
+        # 内层 D 更新属于 G 的计算图，因此 fake_images 不能 detach。
+        real_scores = _functional_discriminator(discriminator, params, buffers, real_images)
+        fake_scores = _functional_discriminator(discriminator, params, buffers, fake_images)
+        loss_d = criterion(real_scores.float(), real_targets.float()) + criterion(fake_scores.float(), fake_targets.float())
+        grads = torch.autograd.grad(
+            loss_d,
+            tuple(params.values()),
+            # 保留计算图，使 G 能通过“模拟后的 D 更新”收到梯度。
+            create_graph=True,
+            allow_unused=True,
+        )
+        params, unrolled_state = _adam_unroll_step(params, grads, unrolled_state)
+
+    fake_scores_for_g = _functional_discriminator(discriminator, params, buffers, fake_images)
+    loss_g = criterion(fake_scores_for_g.float(), fool_targets.float())
+    return loss_g, fake_scores_for_g
 
 
 def _next_kimg_boundary(cur_nimg: int, interval_kimg: float) -> int | None:
@@ -133,6 +301,7 @@ def train(args: argparse.Namespace) -> None:
     init_pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=60))
     accelerator = Accelerator(
         gradient_accumulation_steps=max(args.gradient_accumulation_steps, 1),
+        mixed_precision=args.mixed_precision,
         kwargs_handlers=[ddp_kwargs, init_pg_kwargs],
     )
     device = accelerator.device
@@ -164,6 +333,10 @@ def train(args: argparse.Namespace) -> None:
             raise ValueError("当前 DCGAN 结构固定输出 64x64 图片，请保持 --image-size 64")
         if args.batch_size % world_size != 0:
             raise ValueError(f"--batch-size {args.batch_size} 不能被当前进程数 {world_size} 整除")
+        if args.n_dis < 1:
+            raise ValueError("--n-dis must be >= 1")
+        if args.unroll_steps < 0:
+            raise ValueError("--unroll-steps must be >= 0")
         if args.total_kimg <= 0:
             raise ValueError("--total-kimg 必须为正数")
         if args.kimg_per_log <= 0:
@@ -287,31 +460,51 @@ def train(args: argparse.Namespace) -> None:
                 real_targets = torch.ones(batch_size, device=device)
                 fake_targets = torch.zeros(batch_size, device=device)
 
-                with accelerator.accumulate(discriminator):
-                    optimizer_d.zero_grad(set_to_none=True)
-                    with accelerator.autocast():
-                        real_scores = discriminator(real_images)
-                        loss_d_real = criterion(real_scores.float(), real_targets.float())
+                # 真实判别器更新：这里会像普通 DCGAN 一样实际修改 D。
+                for _ in range(args.n_dis):
+                    with accelerator.accumulate(discriminator):
+                        optimizer_d.zero_grad(set_to_none=True)
+                        with accelerator.autocast():
+                            real_scores = discriminator(real_images)
+                            loss_d_real = criterion(real_scores.float(), real_targets.float())
 
-                        noise = make_noise(batch_size, args.latent_dim, device)
-                        with torch.no_grad():
-                            fake_images_d = generator(noise)
-                        fake_scores = discriminator(fake_images_d)
-                        loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
-                        loss_d = loss_d_real + loss_d_fake
-                    accelerator.backward(loss_d)
-                    optimizer_d.step()
+                            noise = make_noise(batch_size, args.latent_dim, device)
+                            with torch.no_grad():
+                                fake_images_d = generator(noise)
+                            fake_scores = discriminator(fake_images_d)
+                            loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
+                            loss_d = loss_d_real + loss_d_fake
+                        accelerator.backward(loss_d)
+                        optimizer_d.step()
 
                 with accelerator.accumulate(generator):
                     optimizer_g.zero_grad(set_to_none=True)
                     fool_targets = torch.ones(batch_size, device=device)
                     with accelerator.autocast():
-                        noise = make_noise(batch_size, args.latent_dim, device)
-                        fake_images_g = generator(noise)
-                        fake_scores_for_g = discriminator(fake_images_g)
-                        loss_g = criterion(fake_scores_for_g.float(), fool_targets.float())
+                        if args.unroll_steps > 0:
+                            # Unrolled GAN 分支：先临时模拟 D 更新若干步，再用这个 D 更新 G。
+                            loss_g, fake_scores_for_g = _unrolled_generator_loss(
+                                generator=generator,
+                                discriminator=accelerator.unwrap_model(discriminator),
+                                criterion=criterion,
+                                optimizer_d=optimizer_d,
+                                real_images=real_images,
+                                latent_dim=args.latent_dim,
+                                device=device,
+                                unroll_steps=args.unroll_steps,
+                                real_targets=real_targets,
+                                fake_targets=fake_targets,
+                                fool_targets=fool_targets,
+                            )
+                        else:
+                            noise = make_noise(batch_size, args.latent_dim, device)
+                            fake_images_g = generator(noise)
+                            fake_scores_for_g = discriminator(fake_images_g)
+                            loss_g = criterion(fake_scores_for_g.float(), fool_targets.float())
                     accelerator.backward(loss_g)
                     optimizer_g.step()
+                    # unroll 分支可能留下临时 D 梯度，下一轮真实 D 更新前先清空。
+                    optimizer_d.zero_grad(set_to_none=True)
 
                 if generator_ema is not None:
                     update_ema(generator_ema, generator, args.ema_decay)
@@ -396,8 +589,10 @@ def train(args: argparse.Namespace) -> None:
                             nrow=8,
                         )
 
+                    # 区分保存类型，方便后续对比 DCGAN 与 Unrolled DCGAN。
+                    model_type = "unrolled_dcgan" if args.unroll_steps > 0 else "dcgan"
                     state = {
-                        "model_type": "dcgan",
+                        "model_type": model_type,
                         "epoch": current_epoch,
                         "cur_nimg": cur_nimg,
                         "global_step": global_step,
@@ -415,7 +610,7 @@ def train(args: argparse.Namespace) -> None:
                     }
                     if should_save:
                         torch.save(state, layout.checkpoint_dir / "latest.pt")
-                        torch.save(state, layout.checkpoint_dir / f"dcgan_nimg_{cur_nimg:08d}.pt")
+                        torch.save(state, layout.checkpoint_dir / f"{model_type}_nimg_{cur_nimg:08d}.pt")
 
                     should_eval = False
                     if requested_metrics and args.eval_every_kimg > 0:
