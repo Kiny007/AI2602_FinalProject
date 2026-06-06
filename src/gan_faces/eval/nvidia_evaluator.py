@@ -14,6 +14,7 @@ from .nvidia_metrics import metric_main, metric_utils
 _METRIC_ALIASES = {
     "fid": "fid5k",
     "is": "is5k",
+    "ndb": "ndb5k",
     "both": "fid5k,is5k",
 }
 
@@ -24,7 +25,11 @@ def supported_metrics() -> list[str]:
 
 def parse_metrics(metric_text: str) -> list[str]:
     normalized = _METRIC_ALIASES.get(metric_text.strip().lower(), metric_text)
-    metrics = [item.strip() for item in normalized.split(",") if item.strip()]
+    metrics = [
+        _METRIC_ALIASES.get(item.strip().lower(), item.strip())
+        for item in normalized.split(",")
+        if item.strip()
+    ]
     invalid = [metric for metric in metrics if not metric_main.is_valid_metric(metric)]
     if invalid:
         raise ValueError(

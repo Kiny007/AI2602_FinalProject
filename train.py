@@ -10,10 +10,12 @@ import argparse
 import copy
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import InitProcessGroupKwargs
 from torch import nn, optim
 
 
@@ -128,9 +130,10 @@ def train(args: argparse.Namespace) -> None:
     """使用 accelerate 统一单卡、多卡与混合精度训练。"""
 
     ddp_kwargs = DistributedDataParallelKwargs(broadcast_buffers=False)
+    init_pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=60))
     accelerator = Accelerator(
         gradient_accumulation_steps=max(args.gradient_accumulation_steps, 1),
-        kwargs_handlers=[ddp_kwargs],
+        kwargs_handlers=[ddp_kwargs, init_pg_kwargs],
     )
     device = accelerator.device
     world_size = accelerator.num_processes
@@ -256,6 +259,8 @@ def train(args: argparse.Namespace) -> None:
                 init_model = generator_ema if generator_ema is not None else accelerator.unwrap_model(generator).eval()
                 init_samples = init_model(fixed_noise)
             logger.save_samples(init_samples, layout.sample_dir / "fakes_init.png", global_step=0, nrow=8)
+        if world_size > 1:
+            accelerator.wait_for_everyone()
 
         while cur_nimg < total_nimg:
             if interrupt_requested():
@@ -272,9 +277,12 @@ def train(args: argparse.Namespace) -> None:
                 real_images = real_images.to(device, non_blocking=True)
                 batch_size = real_images.size(0)
 
-                if is_rank0 and not saved_reals:
-                    save_generated_grid(real_images, layout.sample_dir / "reals.png", nrow=8)
+                if not saved_reals:
+                    if is_rank0:
+                        save_generated_grid(real_images, layout.sample_dir / "reals.png", nrow=8)
                     saved_reals = True
+                    if world_size > 1:
+                        accelerator.wait_for_everyone()
 
                 real_targets = torch.ones(batch_size, device=device)
                 fake_targets = torch.zeros(batch_size, device=device)
