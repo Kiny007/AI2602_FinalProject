@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from torch import nn, optim
+import torch.nn.functional as F
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -39,6 +40,18 @@ from gan_faces.train_runtime import (
 from gan_faces.utils import count_parameters, ensure_dir, make_noise, save_generated_grid
 
 
+def _str2bool(value: str) -> bool:
+    """把命令行里的 true/false 文本解析为布尔值。"""
+
+    text = value.strip().lower()
+    if text in {"true", "1", "yes", "y", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"无法解析布尔值: {value}")
+
+
+
 def parse_args() -> argparse.Namespace:
     """解析 DCGAN 训练所需的命令行参数。"""
 
@@ -58,7 +71,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-dim", type=int, default=100)
     parser.add_argument("--generator-features", type=int, default=64)
     parser.add_argument("--discriminator-features", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--spectral-norm", type=_str2bool, default=False, help="是否为 DCGAN 判别器卷积层启用谱归一化，传 true/false")
+    parser.add_argument("--lr_g", type=float, default=2e-4)
+    parser.add_argument("--lr_d", type=float, default=2e-4)
     parser.add_argument("--beta1", type=float, default=0.5)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--total-kimg", type=float, default=1000.0, help="总训练长度，单位 kimg")
@@ -77,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--allow-tf32", action="store_true", help="允许 CUDA matmul/conv 使用 TF32 提升吞吐")
+    parser.add_argument("--loss", type=str, choices=["bce", "hinge"], default="bce", help="损失函数类型bce或hinge")
     apply_config_defaults(parser, load_yaml_config(config_args.config))
     return parser.parse_args(remaining_argv)
 
@@ -92,15 +108,22 @@ def build_training_components(args: argparse.Namespace, device: torch.device):
     disc_args = {
         "image_channels": 3,
         "feature_maps": args.discriminator_features,
+        "use_spectral_norm": args.spectral_norm,
     }
     generator = Generator(**model_args).to(device)
     discriminator = Discriminator(**disc_args).to(device)
     generator.apply(init_dcgan_weights)
     discriminator.apply(init_dcgan_weights)
 
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer_g = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
-    optimizer_d = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
+    if args.loss == "bce":
+        criterion = nn.BCEWithLogitsLoss()
+    elif args.loss == "hinge":
+        criterion = None  # Hinge 损失在训练循环里直接计算，不使用单独的 loss 模块
+    else:
+        raise ValueError(f"不支持的损失函数类型: {args.loss}")
+
+    optimizer_g = optim.Adam(generator.parameters(), lr=args.lr_g, betas=(args.beta1, 0.999))
+    optimizer_d = optim.Adam(discriminator.parameters(), lr=args.lr_d, betas=(args.beta1, 0.999))
     return generator, discriminator, criterion, optimizer_g, optimizer_d, model_args, disc_args
 
 
@@ -283,13 +306,19 @@ def train(args: argparse.Namespace) -> None:
                     optimizer_d.zero_grad(set_to_none=True)
                     with accelerator.autocast():
                         real_scores = discriminator(real_images)
-                        loss_d_real = criterion(real_scores.float(), real_targets.float())
+                        if args.loss == "hinge":
+                            loss_d_real = torch.mean(F.relu(1.0 - real_scores))
+                        else:
+                            loss_d_real = criterion(real_scores.float(), real_targets.float())
 
                         noise = make_noise(batch_size, args.latent_dim, device)
                         with torch.no_grad():
                             fake_images_d = generator(noise)
                         fake_scores = discriminator(fake_images_d)
-                        loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
+                        if args.loss == "hinge":
+                            loss_d_fake = torch.mean(F.relu(1.0 + fake_scores))
+                        else:
+                            loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
                         loss_d = loss_d_real + loss_d_fake
                     accelerator.backward(loss_d)
                     optimizer_d.step()
@@ -301,7 +330,10 @@ def train(args: argparse.Namespace) -> None:
                         noise = make_noise(batch_size, args.latent_dim, device)
                         fake_images_g = generator(noise)
                         fake_scores_for_g = discriminator(fake_images_g)
-                        loss_g = criterion(fake_scores_for_g.float(), fool_targets.float())
+                        if args.loss == "hinge":
+                            loss_g = -torch.mean(fake_scores_for_g)
+                        else:
+                            loss_g = criterion(fake_scores_for_g.float(), fool_targets.float())
                     accelerator.backward(loss_g)
                     optimizer_g.step()
 

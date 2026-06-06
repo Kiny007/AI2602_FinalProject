@@ -120,4 +120,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# python evaluate.py --checkpoint outputs/dcgan_bce_sigmoid/checkpoints/latest.pt --data-root ".\data\celeba\img_align_celeba" --metrics fid5k --device cuda --verbose
+# python evaluate.py --checkpoint outputs/dcgan_acc_zip_256/checkpoints/latest.pt --data-root ".\data\celeba\img_align_celeba" --metrics fid5k --device cuda --verbose

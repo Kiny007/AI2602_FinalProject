@@ -7,7 +7,9 @@ image_size: 64
 latent_dim: 100
 generator_features: 64
 discriminator_features: 64
-lr: 0.0002
+spectral_norm: false
+lr_d: 0.0002
+lr_g: 0.0002
 beta1: 0.5
 workers: 0
 kimg_per_log: 0.5
