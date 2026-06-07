@@ -1,11 +1,11 @@
-# WGAN-GP uses the improved_wgan_training 64x64 ResNet generator/critic.
+# WGAN-GP uses the DCGAN 64x64 architecture with a LayerNorm-style critic.
 dataset: folder
 data_root: data/celeba_64.zip
 download: false
 output_dir: outputs/wgan_gp_acc_zip
-batch_size: 64
+batch_size: 128
 image_size: 64
-latent_dim: 128
+latent_dim: 100
 generator_features: 64
 discriminator_features: 64
 model_type: wgan_gp
