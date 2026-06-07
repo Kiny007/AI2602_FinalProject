@@ -67,7 +67,7 @@ def save_json(data: dict[str, Any], output_path: Union[str, Path]) -> None:
 def build_generator(model_type: str, model_args: dict[str, Any]) -> nn.Module:
     """根据 checkpoint 中的模型类型创建对应生成器。"""
 
-    if model_type == "dcgan":
+    if model_type in {"dcgan", "unrolled_dcgan"}:
         return Generator(**model_args)
     if model_type == "stylegan_lite":
         return StyleGeneratorLite(**model_args)

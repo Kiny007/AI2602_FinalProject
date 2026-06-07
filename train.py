@@ -529,6 +529,14 @@ def train(args: argparse.Namespace) -> None:
                 global_step = int(cur_nimg // 1000)
                 cur_kimg = cur_nimg / 1000.0
                 reached_end = cur_nimg >= total_nimg
+                should_eval = False
+                if requested_metrics and args.eval_every_kimg > 0:
+                    should_eval = reached_end or (next_eval_nimg is not None and cur_nimg >= next_eval_nimg)
+                    if should_eval and next_eval_nimg is not None and cur_nimg >= next_eval_nimg:
+                        next_eval_nimg = _next_kimg_boundary(cur_nimg, args.eval_every_kimg)
+
+                if should_eval and world_size > 1:
+                    accelerator.wait_for_everyone()
 
                 if is_rank0:
                     sec_per_step = time.perf_counter() - step_start
@@ -612,11 +620,6 @@ def train(args: argparse.Namespace) -> None:
                         torch.save(state, layout.checkpoint_dir / "latest.pt")
                         torch.save(state, layout.checkpoint_dir / f"{model_type}_nimg_{cur_nimg:08d}.pt")
 
-                    should_eval = False
-                    if requested_metrics and args.eval_every_kimg > 0:
-                        should_eval = reached_end or (next_eval_nimg is not None and cur_nimg >= next_eval_nimg)
-                        if should_eval and next_eval_nimg is not None and cur_nimg >= next_eval_nimg:
-                            next_eval_nimg = _next_kimg_boundary(cur_nimg, args.eval_every_kimg)
                     if should_eval:
                         eval_model = generator_ema if generator_ema is not None else accelerator.unwrap_model(generator).eval()
                         adapter = AI2602GeneratorAdapter.from_generator(eval_model, z_dim=args.latent_dim, device=device)
@@ -648,6 +651,9 @@ def train(args: argparse.Namespace) -> None:
                             },
                         )
                         print(f"中间评测 @ nimg={cur_nimg}, kimg={cur_kimg:.3f}: {eval_result['metrics']}")
+
+                if should_eval and world_size > 1:
+                    accelerator.wait_for_everyone()
 
                 if reached_end:
                     break
