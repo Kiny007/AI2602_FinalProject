@@ -509,6 +509,8 @@ def train(args: argparse.Namespace) -> None:
 
 
                 if should_eval:
+                    if is_rank0:
+                        print(f"Starting inline eval @ nimg={cur_nimg}, kimg={cur_kimg:.3f}: {requested_metrics}", flush=True)
                     if world_size > 1:
                         accelerator.wait_for_everyone()
                     eval_model = generator_ema if generator_ema is not None else accelerator.unwrap_model(generator).eval()
@@ -546,6 +548,7 @@ def train(args: argparse.Namespace) -> None:
                             },
                         )
                         print(f"中间评测 @ nimg={cur_nimg}, kimg={cur_kimg:.3f}: {eval_result['metrics']}")
+                        print(f"Finished inline eval @ nimg={cur_nimg}, kimg={cur_kimg:.3f}", flush=True)
                     if world_size > 1:
                         accelerator.wait_for_everyone()
                 if reached_end:
