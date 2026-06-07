@@ -82,6 +82,164 @@ class Discriminator(nn.Module):
         return self.net(image).view(-1)
 
 
+class _UpsampleConv2d(nn.Module):
+    """Nearest-neighbor upsample followed by a SAME-style convolution."""
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, bias: bool = True) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=2, mode="nearest")
+        return self.conv(x)
+
+
+class _ConvMeanPool2d(nn.Module):
+    """SAME-style convolution followed by 2x mean pooling."""
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, bias: bool = True) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.avg_pool2d(self.conv(x), kernel_size=2, stride=2)
+
+
+class _MeanPoolConv2d(nn.Module):
+    """2x mean pooling followed by a SAME-style convolution."""
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, bias: bool = True) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(F.avg_pool2d(x, kernel_size=2, stride=2))
+
+
+def _wgan_gp_norm(channels: int, norm: str) -> nn.Module:
+    if norm == "batch":
+        return nn.BatchNorm2d(channels)
+    if norm == "layer":
+        # improved_wgan_training replaces discriminator BatchNorm with per-sample
+        # normalization for WGAN-GP; GroupNorm(1, C) has the same batch-independent
+        # behavior for BCHW tensors.
+        return nn.GroupNorm(1, channels)
+    raise ValueError(f"Unsupported WGAN-GP norm: {norm}")
+
+
+class WGANGPResidualBlock(nn.Module):
+    """Residual block used by improved_wgan_training's 64x64 WGAN-GP models."""
+
+    def __init__(self, in_channels: int, out_channels: int, resample: str | None, norm: str) -> None:
+        super().__init__()
+        if resample not in {None, "up", "down"}:
+            raise ValueError(f"Invalid resample value: {resample}")
+
+        if resample == "up":
+            self.shortcut = _UpsampleConv2d(in_channels, out_channels, kernel_size=1)
+            self.conv1 = _UpsampleConv2d(in_channels, out_channels, kernel_size=3, bias=False)
+            self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+            conv1_channels = out_channels
+        elif resample == "down":
+            self.shortcut = _MeanPoolConv2d(in_channels, out_channels, kernel_size=1)
+            self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1, bias=False)
+            self.conv2 = _ConvMeanPool2d(in_channels, out_channels, kernel_size=3)
+            conv1_channels = in_channels
+        else:
+            if in_channels == out_channels:
+                self.shortcut = nn.Identity()
+            else:
+                self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+            self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1, bias=False)
+            self.conv2 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+            conv1_channels = in_channels
+
+        self.norm1 = _wgan_gp_norm(in_channels, norm)
+        self.norm2 = _wgan_gp_norm(conv1_channels, norm)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.norm1(x)
+        residual = F.relu(residual, inplace=False)
+        residual = self.conv1(residual)
+        residual = self.norm2(residual)
+        residual = F.relu(residual, inplace=False)
+        residual = self.conv2(residual)
+        return self.shortcut(x) + residual
+
+
+class WGANGPGenerator(nn.Module):
+    """64x64 ResNet generator matching improved_wgan_training's GoodGenerator."""
+
+    def __init__(self, latent_dim: int = 128, image_channels: int = 3, feature_maps: int = 64) -> None:
+        super().__init__()
+        ngf = feature_maps
+
+        self.input = nn.Linear(latent_dim, 4 * 4 * 8 * ngf)
+        self.blocks = nn.Sequential(
+            WGANGPResidualBlock(8 * ngf, 8 * ngf, resample="up", norm="batch"),
+            WGANGPResidualBlock(8 * ngf, 4 * ngf, resample="up", norm="batch"),
+            WGANGPResidualBlock(4 * ngf, 2 * ngf, resample="up", norm="batch"),
+            WGANGPResidualBlock(2 * ngf, ngf, resample="up", norm="batch"),
+        )
+        self.output_norm = nn.BatchNorm2d(ngf)
+        self.output = nn.Conv2d(ngf, image_channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if z.ndim > 2:
+            z = z.flatten(1)
+        x = self.input(z)
+        x = x.view(z.size(0), -1, 4, 4)
+        x = self.blocks(x)
+        x = self.output_norm(x)
+        x = F.relu(x, inplace=False)
+        x = self.output(x)
+        return torch.tanh(x)
+
+
+class WGANGPCritic(nn.Module):
+    """64x64 ResNet critic matching improved_wgan_training's GoodDiscriminator."""
+
+    def __init__(self, image_channels: int = 3, feature_maps: int = 64) -> None:
+        super().__init__()
+        ndf = feature_maps
+
+        self.input = nn.Conv2d(image_channels, ndf, kernel_size=3, stride=1, padding=1)
+        self.blocks = nn.Sequential(
+            WGANGPResidualBlock(ndf, 2 * ndf, resample="down", norm="layer"),
+            WGANGPResidualBlock(2 * ndf, 4 * ndf, resample="down", norm="layer"),
+            WGANGPResidualBlock(4 * ndf, 8 * ndf, resample="down", norm="layer"),
+            WGANGPResidualBlock(8 * ndf, 8 * ndf, resample="down", norm="layer"),
+        )
+        self.output = nn.Linear(4 * 4 * 8 * ndf, 1)
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        x = self.input(image)
+        x = self.blocks(x)
+        x = x.flatten(1)
+        return self.output(x).view(-1)
+
+
 class CycleResidualBlock(nn.Module):
     """CycleGAN 生成器中的残差块，保持特征图尺寸不变。"""
 
@@ -327,6 +485,20 @@ def init_dcgan_weights(module: nn.Module) -> None:
     elif classname.find("BatchNorm") != -1:
         nn.init.normal_(module.weight.data, 1.0, 0.02)
         nn.init.constant_(module.bias.data, 0.0)
+
+
+def init_wgan_gp_weights(module: nn.Module) -> None:
+    """Weight initialization for the improved_wgan_training ResNet WGAN-GP blocks."""
+
+    if isinstance(module, (nn.Conv2d, nn.Linear)):
+        nn.init.xavier_uniform_(module.weight.data)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias.data)
+    elif isinstance(module, (nn.BatchNorm2d, nn.GroupNorm)):
+        if module.weight is not None:
+            nn.init.ones_(module.weight.data)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias.data)
 
 
 def init_stylegan_lite_weights(module: nn.Module) -> None:

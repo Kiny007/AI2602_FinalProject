@@ -8,8 +8,11 @@ __all__ = [
     "Discriminator",
     "Generator",
     "StyleGeneratorLite",
+    "WGANGPCritic",
+    "WGANGPGenerator",
     "init_dcgan_weights",
     "init_stylegan_lite_weights",
+    "init_wgan_gp_weights",
 ]
 
 

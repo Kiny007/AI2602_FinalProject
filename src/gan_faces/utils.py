@@ -14,7 +14,7 @@ import torch
 from torch import nn
 from torchvision.utils import save_image
 
-from .models import CycleGenerator, Generator, StyleGeneratorLite
+from .models import CycleGenerator, Generator, StyleGeneratorLite, WGANGPGenerator
 
 
 def ensure_dir(path: Union[str, Path]) -> Path:
@@ -69,6 +69,8 @@ def build_generator(model_type: str, model_args: dict[str, Any]) -> nn.Module:
 
     if model_type == "dcgan":
         return Generator(**model_args)
+    if model_type == "wgan_gp":
+        return WGANGPGenerator(**model_args)
     if model_type == "stylegan_lite":
         return StyleGeneratorLite(**model_args)
     if model_type in {"cyclegan_a2b", "cyclegan_b2a"}:

@@ -1,4 +1,4 @@
-"""DCGAN 训练入口。
+"""GAN 训练入口。
 
 当前入口采用更偏 NVIDIA 风格的训练组织方式：以 `kimg` 作为统一进度单位，
 并使用 accelerate 管理单卡/多卡与混合精度。
@@ -23,7 +23,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from gan_faces.data import build_dataloader, build_dataset
-from gan_faces.models import Discriminator, Generator, init_dcgan_weights
+from gan_faces.models import (
+    Discriminator,
+    Generator,
+    WGANGPCritic,
+    WGANGPGenerator,
+    init_dcgan_weights,
+    init_wgan_gp_weights,
+)
 from gan_faces.config_utils import apply_config_defaults, load_yaml_config
 from gan_faces.eval.evaluate import AI2602GeneratorAdapter
 from gan_faces.eval.nvidia_evaluator import evaluate_adapter, parse_metrics
@@ -42,14 +49,14 @@ from gan_faces.utils import count_parameters, ensure_dir, make_noise, save_gener
 
 
 def parse_args() -> argparse.Namespace:
-    """解析 DCGAN 训练所需的命令行参数。"""
+    """解析 GAN 训练所需的命令行参数。"""
 
     default_config = PROJECT_ROOT / "src" / "gan_faces" / "config" / "dcgan.yaml"
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", type=str, default=str(default_config), help="YAML 配置文件路径")
     config_args, remaining_argv = config_parser.parse_known_args()
 
-    parser = argparse.ArgumentParser(description="训练 DCGAN 人头图像生成模型")
+    parser = argparse.ArgumentParser(description="训练 GAN 人头图像生成模型")
     parser.add_argument("--config", type=str, default=str(default_config), help="YAML 配置文件路径")
     parser.add_argument("--dataset", choices=["folder", "lfw", "celeba"], default="folder")
     parser.add_argument("--data-root", type=str, default="data/faces")
@@ -60,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-dim", type=int, default=100)
     parser.add_argument("--generator-features", type=int, default=64)
     parser.add_argument("--discriminator-features", type=int, default=64)
+    parser.add_argument("--model-type", choices=["dcgan", "wgan_gp"], default="dcgan")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--beta1", type=float, default=0.5)
     parser.add_argument("--beta2", type=float, default=0.999)
@@ -102,10 +110,16 @@ def build_training_components(args: argparse.Namespace, device: torch.device):
         "image_channels": 3,
         "feature_maps": args.discriminator_features,
     }
-    generator = Generator(**model_args).to(device)
-    discriminator = Discriminator(**disc_args).to(device)
-    generator.apply(init_dcgan_weights)
-    discriminator.apply(init_dcgan_weights)
+    if args.model_type == "wgan_gp":
+        generator = WGANGPGenerator(**model_args).to(device)
+        discriminator = WGANGPCritic(**disc_args).to(device)
+        generator.apply(init_wgan_gp_weights)
+        discriminator.apply(init_wgan_gp_weights)
+    else:
+        generator = Generator(**model_args).to(device)
+        discriminator = Discriminator(**disc_args).to(device)
+        generator.apply(init_dcgan_weights)
+        discriminator.apply(init_dcgan_weights)
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer_g = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
@@ -113,7 +127,7 @@ def build_training_components(args: argparse.Namespace, device: torch.device):
     return generator, discriminator, criterion, optimizer_g, optimizer_d, model_args, disc_args
 
 
-# [WGAN-GP 修改] 在 DCGAN 的 G/D 架构上加入 Wasserstein critic 的梯度惩罚。
+# [WGAN-GP 修改] 为 Wasserstein critic 计算梯度惩罚。
 def compute_gradient_penalty(
     discriminator: nn.Module,
     real_images: torch.Tensor,
@@ -194,8 +208,12 @@ def train(args: argparse.Namespace) -> None:
     is_rank0 = accelerator.is_main_process
 
     try:
+        if args.gan_loss == "wgan_gp" and args.model_type == "dcgan":
+            args.model_type = "wgan_gp"
+        if args.model_type == "wgan_gp" and args.gan_loss != "wgan_gp":
+            raise ValueError("--model-type wgan_gp must be trained with --gan-loss wgan_gp")
         if args.image_size != 64:
-            raise ValueError("当前 DCGAN 结构固定输出 64x64 图片，请保持 --image-size 64")
+            raise ValueError("当前训练结构固定输出 64x64 图片，请保持 --image-size 64")
         if args.batch_size % world_size != 0:
             raise ValueError(f"--batch-size {args.batch_size} 不能被当前进程数 {world_size} 整除")
         if args.total_kimg <= 0:
@@ -485,8 +503,7 @@ def train(args: argparse.Namespace) -> None:
                         )
 
                     state = {
-                        "model_type": "dcgan",
-                        # [WGAN-GP 修改] 生成器结构仍是 DCGAN；训练目标单独记录，避免评估脚本加载失败。
+                        "model_type": args.model_type,
                         "training_objective": args.gan_loss,
                         "epoch": current_epoch,
                         "cur_nimg": cur_nimg,
@@ -505,7 +522,7 @@ def train(args: argparse.Namespace) -> None:
                     }
                     if should_save:
                         torch.save(state, layout.checkpoint_dir / "latest.pt")
-                        torch.save(state, layout.checkpoint_dir / f"dcgan_nimg_{cur_nimg:08d}.pt")
+                        torch.save(state, layout.checkpoint_dir / f"{args.model_type}_nimg_{cur_nimg:08d}.pt")
 
 
                 if should_eval:
@@ -557,7 +574,7 @@ def train(args: argparse.Namespace) -> None:
             current_epoch += 1
 
         if is_rank0:
-            print("DCGAN 训练完成。")
+            print(f"{args.model_type} 训练完成。")
     except KeyboardInterrupt:
         if is_rank0:
             print("\n收到中断信号，正在清理训练进程并释放资源...")
