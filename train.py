@@ -335,50 +335,77 @@ def train(args: argparse.Namespace) -> None:
             generator.train()
             discriminator.train()
 
-            for step, real_images in enumerate(dataloader, start=1):
+            data_iter = iter(dataloader)
+            step = 0
+            epoch_exhausted = False
+            while not epoch_exhausted:
                 if interrupt_requested():
                     raise KeyboardInterrupt
                 step_start = time.perf_counter()
-                real_images = real_images.to(device, non_blocking=True)
-                batch_size = real_images.size(0)
-
-                if not saved_reals:
-                    if is_rank0:
-                        save_generated_grid(real_images, layout.sample_dir / "reals.png", nrow=8)
-                    saved_reals = True
-                    if world_size > 1:
-                        accelerator.wait_for_everyone()
 
                 # [WGAN-GP 修改] 保留原 DCGAN BCE 损失，并新增 WGAN-GP 训练分支。
                 gradient_penalty = torch.zeros((), device=device)
                 wasserstein_estimate = torch.zeros((), device=device)
-                for _ in range(args.n_dis):
-                    with accelerator.accumulate(discriminator):
-                        optimizer_d.zero_grad(set_to_none=True)
-                        noise = make_noise(batch_size, args.latent_dim, device)
-                        with torch.no_grad():
-                            fake_images_d = generator(noise)
+                real_scores = torch.zeros((), device=device)
+                fake_scores = torch.zeros((), device=device)
+                loss_d = torch.zeros((), device=device)
+                batch_size = 0
+                d_updates = args.n_dis if args.gan_loss == "wgan_gp" else 1
 
-                        with accelerator.autocast():
-                            real_scores = discriminator(real_images)
-                            fake_scores = discriminator(fake_images_d)
-                            if args.gan_loss == "wgan_gp":
-                                wasserstein_estimate = real_scores.float().mean() - fake_scores.float().mean()
-                                gradient_penalty = compute_gradient_penalty(
-                                    discriminator,
-                                    real_images,
-                                    fake_images_d.detach(),
-                                    accelerator,
-                                )
-                                loss_d = -wasserstein_estimate + args.gp_lambda * gradient_penalty
-                            else:
-                                real_targets = torch.ones(batch_size, device=device)
-                                fake_targets = torch.zeros(batch_size, device=device)
-                                loss_d_real = criterion(real_scores.float(), real_targets.float())
-                                loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
-                                loss_d = loss_d_real + loss_d_fake
-                        accelerator.backward(loss_d)
-                        optimizer_d.step()
+                generator_was_training = generator.training
+                if args.gan_loss == "wgan_gp":
+                    generator.eval()
+                try:
+                    for _ in range(d_updates):
+                        try:
+                            real_images = next(data_iter)
+                        except StopIteration:
+                            epoch_exhausted = True
+                            break
+
+                        step += 1
+                        real_images = real_images.to(device, non_blocking=True)
+                        batch_size = real_images.size(0)
+
+                        if not saved_reals:
+                            if is_rank0:
+                                save_generated_grid(real_images, layout.sample_dir / "reals.png", nrow=8)
+                            saved_reals = True
+                            if world_size > 1:
+                                accelerator.wait_for_everyone()
+
+                        with accelerator.accumulate(discriminator):
+                            optimizer_d.zero_grad(set_to_none=True)
+                            noise = make_noise(batch_size, args.latent_dim, device)
+                            with torch.no_grad():
+                                fake_images_d = generator(noise)
+
+                            with accelerator.autocast():
+                                real_scores = discriminator(real_images)
+                                fake_scores = discriminator(fake_images_d)
+                                if args.gan_loss == "wgan_gp":
+                                    wasserstein_estimate = real_scores.float().mean() - fake_scores.float().mean()
+                                    gradient_penalty = compute_gradient_penalty(
+                                        discriminator,
+                                        real_images,
+                                        fake_images_d.detach(),
+                                        accelerator,
+                                    )
+                                    loss_d = -wasserstein_estimate + args.gp_lambda * gradient_penalty
+                                else:
+                                    real_targets = torch.ones(batch_size, device=device)
+                                    fake_targets = torch.zeros(batch_size, device=device)
+                                    loss_d_real = criterion(real_scores.float(), real_targets.float())
+                                    loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
+                                    loss_d = loss_d_real + loss_d_fake
+                            accelerator.backward(loss_d)
+                            optimizer_d.step()
+                finally:
+                    if args.gan_loss == "wgan_gp" and generator_was_training:
+                        generator.train()
+
+                if batch_size == 0:
+                    break
 
                 with accelerator.accumulate(generator):
                     optimizer_g.zero_grad(set_to_none=True)
