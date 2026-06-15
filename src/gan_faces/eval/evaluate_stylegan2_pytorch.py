@@ -16,7 +16,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_STYLEGAN2_ROOT = PROJECT_ROOT.parent / "stylegan2-pytorch"
 sys.path.insert(0, str(SRC_ROOT))
 
-from gan_faces.eval.nvidia_evaluator import evaluate_adapter, parse_metrics, supported_metrics
+from gan_faces.eval.nvidia_evaluator import (
+    add_ppl_metric_args,
+    collect_ppl_metric_kwargs,
+    evaluate_adapter,
+    has_ppl_metric,
+    parse_metrics,
+    supported_metrics,
+)
 from gan_faces.utils import get_device, save_json, set_random_seed
 
 
@@ -73,18 +80,31 @@ class StyleGAN2PytorchAdapter(nn.Module):
         self.num_layers = num_layers
         self.trunc_psi = trunc_psi
         self.noise_device = noise_device
+        self.supports_w_space = True
 
     def forward(self, z: torch.Tensor, c: torch.Tensor | None = None, **_kwargs) -> torch.Tensor:
         del c
         if z.ndim > 2:
             z = z.view(z.size(0), -1)
 
+        styles = self.mapping(z)
+        return self.synthesis(styles)
+
+    def mapping(self, z: torch.Tensor, c: torch.Tensor | None = None, **_kwargs) -> torch.Tensor:
+        del c
+        if z.ndim > 2:
+            z = z.view(z.size(0), -1)
         styles = self.style_vectorizer(z)
         if self.trunc_psi >= 0:
             styles = self._truncate_style(styles, S=self.style_vectorizer, trunc_psi=self.trunc_psi)
+        return styles
 
-        w_styles = self._styles_def_to_tensor([(styles, self.num_layers)])
-        noise = self._image_noise(z.size(0), self.img_resolution, device=self.noise_device)
+    def synthesis(self, ws: torch.Tensor, **_kwargs) -> torch.Tensor:
+        if ws.ndim == 3:
+            ws = ws[:, 0]
+
+        w_styles = self._styles_def_to_tensor([(ws, self.num_layers)])
+        noise = self._image_noise(ws.size(0), self.img_resolution, device=self.noise_device)
         images = self.generator(w_styles, noise).clamp_(0.0, 1.0)
         return images.mul(2.0).sub(1.0)
 
@@ -108,8 +128,9 @@ def parse_args() -> argparse.Namespace:
         "--metrics",
         type=str,
         default="fid5k",
-        help="逗号分隔的指标名，例如 fid5k,kid5k,pr5k3,is5k；兼容 fid/is/both",
+        help="逗号分隔的指标名，例如 fid5k,kid5k,pr5k3,is5k,ppl_z,ppl_w；兼容 fid/is/both/ppl",
     )
+    add_ppl_metric_args(parser)
     parser.add_argument("--trunc-psi", type=float, default=0.75, help="使用 EMA 生成器时的 truncation psi")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", type=str, default="cuda")
@@ -182,6 +203,7 @@ def main() -> None:
     set_random_seed(args.seed)
     device = get_device(args.device)
     metrics = parse_metrics(args.metrics)
+    metric_kwargs = collect_ppl_metric_kwargs(args)
 
     adapter, checkpoint_spec = build_stylegan2_pytorch_adapter(
         checkpoint_path=args.checkpoint,
@@ -196,6 +218,7 @@ def main() -> None:
         metrics=metrics,
         verbose=args.verbose,
         cache=not args.no_cache,
+        metric_kwargs=metric_kwargs,
     )
     result["checkpoint"] = str(Path(args.checkpoint).resolve())
     result["stylegan2_root"] = str(Path(args.stylegan2_root).resolve())
@@ -210,6 +233,8 @@ def main() -> None:
     result["requested_metrics"] = metrics
     result["device"] = str(device)
     result["trunc_psi"] = args.trunc_psi
+    if has_ppl_metric(metrics):
+        result["ppl_config"] = metric_kwargs
 
     save_json(result, args.output_json)
     print("可用指标: " + ", ".join(supported_metrics()))

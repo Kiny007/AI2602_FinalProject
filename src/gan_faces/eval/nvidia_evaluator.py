@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ _METRIC_ALIASES = {
     "is": "is5k",
     "ndb": "ndb5k",
     "both": "fid5k,is5k",
+    "ppl": "ppl_z,ppl_w",
 }
 
 
@@ -38,12 +40,60 @@ def parse_metrics(metric_text: str) -> list[str]:
     return metrics
 
 
+def has_ppl_metric(metrics: list[str]) -> bool:
+    return any(metric in {"ppl_z", "ppl_w"} for metric in metrics)
+
+
+def add_ppl_metric_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--ppl-num-samples",
+        type=int,
+        default=10,
+        help="PPL 短跑指标的采样数量；默认沿用 PPL.ipynb 的 num_samples=10",
+    )
+    parser.add_argument(
+        "--ppl-epsilon",
+        type=float,
+        default=1e-4,
+        help="PPL 短跑指标的 epsilon；默认沿用 PPL.ipynb 的 eps=1e-4",
+    )
+    parser.add_argument(
+        "--ppl-batch-size",
+        type=int,
+        default=2,
+        help="PPL 计算时每批生成的潜变量对数量",
+    )
+    parser.add_argument(
+        "--ppl-sampling",
+        type=str,
+        choices=["full", "end"],
+        default="full",
+        help="PPL 短跑指标的路径采样方式；full 表示 t 在 [0, 1] 上随机采样",
+    )
+    parser.add_argument(
+        "--ppl-crop",
+        action="store_true",
+        help="计算 PPL 前使用 StyleGAN 官方中心裁剪；PPL.ipynb 默认不裁剪",
+    )
+
+
+def collect_ppl_metric_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "ppl_num_samples": args.ppl_num_samples,
+        "ppl_epsilon": args.ppl_epsilon,
+        "ppl_batch_size": args.ppl_batch_size,
+        "ppl_sampling": args.ppl_sampling,
+        "ppl_crop": args.ppl_crop,
+    }
+
+
 def evaluate_adapter(
     adapter: torch.nn.Module,
     data_path: str | Path,
     metrics: list[str],
     verbose: bool = True,
     cache: bool = True,
+    metric_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     data_path = Path(data_path)
     if not data_path.exists():
@@ -70,6 +120,7 @@ def evaluate_adapter(
             device=next(adapter.parameters()).device,
             progress=progress,
             cache=cache,
+            metric_kwargs=metric_kwargs or {},
         )
         metric_results[metric] = dict(result.results)
 

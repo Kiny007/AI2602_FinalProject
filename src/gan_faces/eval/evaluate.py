@@ -12,7 +12,14 @@ from torch import nn
 SRC_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SRC_ROOT))
 
-from gan_faces.eval.nvidia_evaluator import evaluate_adapter, parse_metrics, supported_metrics
+from gan_faces.eval.nvidia_evaluator import (
+    add_ppl_metric_args,
+    collect_ppl_metric_kwargs,
+    evaluate_adapter,
+    has_ppl_metric,
+    parse_metrics,
+    supported_metrics,
+)
 from gan_faces.utils import get_device, load_generator_from_checkpoint, save_json, set_random_seed
 
 
@@ -26,6 +33,9 @@ class AI2602GeneratorAdapter(nn.Module):
         self.c_dim = 0
         self.img_resolution = img_resolution
         self.img_channels = img_channels
+        self.supports_w_space = callable(getattr(generator, "mapping", None)) and all(
+            hasattr(generator, name) for name in ["constant", "blocks", "to_rgb"]
+        )
 
     @classmethod
     def from_generator(cls, generator: nn.Module, z_dim: int, device: torch.device) -> "AI2602GeneratorAdapter":
@@ -47,6 +57,24 @@ class AI2602GeneratorAdapter(nn.Module):
             z = z.view(z.size(0), -1)
         return self.generator(z)
 
+    def mapping(self, z: torch.Tensor, c: torch.Tensor | None = None, **_kwargs) -> torch.Tensor:
+        del c
+        if not callable(getattr(self.generator, "mapping", None)):
+            raise AttributeError("当前生成器没有 mapping()，不能计算 w-space PPL")
+        if z.ndim > 2:
+            z = z.view(z.size(0), -1)
+        return self.generator.mapping(z)
+
+    def synthesis(self, ws: torch.Tensor, **_kwargs) -> torch.Tensor:
+        if not all(hasattr(self.generator, name) for name in ["constant", "blocks", "to_rgb"]):
+            raise AttributeError("当前生成器没有 w-space synthesis()，不能计算 w-space PPL")
+        if ws.ndim == 3:
+            ws = ws[:, 0]
+        x = self.generator.constant.repeat(ws.size(0), 1, 1, 1)
+        for block in self.generator.blocks:
+            x = block(x, ws)
+        return self.generator.to_rgb(x)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="使用 NVIDIA StyleGAN2-ADA 标准指标评估生成器")
@@ -62,10 +90,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="fid5k",
         help=(
-            "逗号分隔的 NVIDIA 指标名，例如 fid5k,kid5k,pr5k3,is5k；"
-            "兼容旧别名 fid/is/both"
+            "逗号分隔的 NVIDIA 指标名，例如 fid5k,kid5k,pr5k3,is5k,ppl_z,ppl_w；"
+            "兼容旧别名 fid/is/both/ppl"
         ),
     )
+    add_ppl_metric_args(parser)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--verbose", action="store_true", help="打印 NVIDIA 指标计算进度")
@@ -91,6 +120,7 @@ def main() -> None:
     set_random_seed(args.seed)
     device = get_device(args.device)
     metrics = parse_metrics(args.metrics)
+    metric_kwargs = collect_ppl_metric_kwargs(args)
 
     adapter, checkpoint = build_adapter_from_checkpoint(args.checkpoint, device)
     result = evaluate_adapter(
@@ -99,12 +129,15 @@ def main() -> None:
         metrics=metrics,
         verbose=args.verbose,
         cache=not args.no_cache,
+        metric_kwargs=metric_kwargs,
     )
     result["checkpoint"] = str(args.checkpoint)
     result["model_type"] = checkpoint.get("model_type", "dcgan")
     result["metric_backend"] = "nvidia_stylegan2_ada"
     result["requested_metrics"] = metrics
     result["device"] = str(device)
+    if has_ppl_metric(metrics):
+        result["ppl_config"] = metric_kwargs
     
     if args.output_json is None:
         output_json = Path(args.checkpoint).parent.parent / "metrics" / "nvidia_metrics.json"

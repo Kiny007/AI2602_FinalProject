@@ -13,7 +13,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_STYLEGAN2_ADA_ROOT = PROJECT_ROOT.parent / "stylegan2-ada-pytorch"
 sys.path.insert(0, str(SRC_ROOT))
 
-from gan_faces.eval.nvidia_evaluator import evaluate_adapter, parse_metrics, supported_metrics
+from gan_faces.eval.nvidia_evaluator import (
+    add_ppl_metric_args,
+    collect_ppl_metric_kwargs,
+    evaluate_adapter,
+    has_ppl_metric,
+    parse_metrics,
+    supported_metrics,
+)
 from gan_faces.utils import get_device, save_json, set_random_seed
 
 
@@ -41,8 +48,9 @@ def parse_args() -> argparse.Namespace:
         "--metrics",
         type=str,
         default="fid5k",
-        help="逗号分隔的指标名，例如 fid5k,kid5k,pr5k3,is5k；兼容 fid/is/both",
+        help="逗号分隔的指标名，例如 fid5k,kid5k,pr5k3,is5k,ppl_z,ppl_w；兼容 fid/is/both/ppl",
     )
+    add_ppl_metric_args(parser)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--verbose", action="store_true", help="打印 NVIDIA 指标计算进度")
@@ -89,6 +97,7 @@ def main() -> None:
     set_random_seed(args.seed)
     device = get_device(args.device)
     metrics = parse_metrics(args.metrics)
+    metric_kwargs = collect_ppl_metric_kwargs(args)
 
     adapter, metadata = build_stylegan2_ada_adapter(
         checkpoint_path=args.checkpoint,
@@ -102,6 +111,7 @@ def main() -> None:
         metrics=metrics,
         verbose=args.verbose,
         cache=not args.no_cache,
+        metric_kwargs=metric_kwargs,
     )
     result["checkpoint"] = str(Path(args.checkpoint).resolve())
     result["stylegan2_ada_root"] = str(Path(args.stylegan2_ada_root).resolve())
@@ -110,6 +120,8 @@ def main() -> None:
     result["requested_metrics"] = metrics
     result["device"] = str(device)
     result["checkpoint_metadata"] = metadata
+    if has_ppl_metric(metrics):
+        result["ppl_config"] = metric_kwargs
 
     save_json(result, args.output_json)
     print("可用指标: " + ", ".join(supported_metrics()))

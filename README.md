@@ -1,6 +1,6 @@
 # 基于 GAN 的人头图像生成
 
-本项目根据 `project.pdf` 搭建：使用 DCGAN 完成基础人头图像生成，支持生成样例、潜变量线性插值、TensorBoard 训练可视化、Inception Score（IS）和 FID 评估，并补充 Bonus 1：对比轻量 StyleGAN 风格模型或 CycleGAN 与基础 DCGAN 的性能差异。
+本项目根据 `project.pdf` 搭建：使用 DCGAN 完成基础人头图像生成，支持生成样例、潜变量线性/球面插值、TensorBoard 训练可视化、Inception Score（IS）、FID 和 PPL 评估，并补充 Bonus 1：对比轻量 StyleGAN 风格模型或 CycleGAN 与基础 DCGAN 的性能差异。
 
 ## 项目结构
 
@@ -10,7 +10,7 @@
 ├── train_stylegan.py        # 训练轻量 StyleGAN 风格模型
 ├── train_cyclegan.py        # 训练 CycleGAN 无配对图像域转换模型
 ├── generate.py              # 使用训练好的生成器生成图片
-├── interpolate.py           # 在两张生成头像之间做线性插值
+├── interpolate.py           # 在两张生成头像之间做线性/球面插值
 ├── evaluate.py              # 使用 IS/FID 评估生成图像质量
 ├── compare_models.py        # 对比 DCGAN 与 StyleGAN-Lite
 ├── compare_gan_cyclegan.py  # 对比 DCGAN 与 CycleGAN
@@ -141,21 +141,30 @@ python generate.py --checkpoint outputs/dcgan/checkpoints/latest.pt --num-images
 python generate.py --checkpoint outputs/stylegan_lite/checkpoints/latest.pt --num-images 64 --output outputs/generated/stylegan_lite_grid.png
 ```
 
-## 两张头像之间的线性插值
+## 两张头像之间的潜变量插值
 
-DCGAN 没有编码器，因此这里按照 GAN 常见做法：选取两个潜变量作为两张生成头像的端点，在潜变量空间中做线性插值，并观察生成头像的连续变化。
+DCGAN 没有编码器，因此这里按照 GAN 常见做法：选取两个潜变量作为两张生成头像的端点，在潜变量空间中插值，并观察生成头像的连续变化。
+
+线性插值直接在两点之间连直线：
 
 ```powershell
-python interpolate.py --checkpoint outputs/dcgan/checkpoints/latest.pt --steps 12 --output outputs/interpolation/dcgan_linear.png
-python interpolate.py --checkpoint outputs/stylegan_lite/checkpoints/latest.pt --steps 12 --output outputs/interpolation/stylegan_lite_linear.png
+python interpolate.py --checkpoint outputs/dcgan/checkpoints/latest.pt --method linear --steps 12 --output outputs/interpolation/dcgan_linear.png
+python interpolate.py --checkpoint outputs/stylegan_lite/checkpoints/latest.pt --method linear --steps 12 --output outputs/interpolation/stylegan_lite_linear.png
 ```
 
-## IS / FID 评估
+球面插值适合从标准正态分布采样的 z 空间，路径会更贴近潜变量分布所在的高维球面：
 
 ```powershell
-python evaluate.py --metric is --checkpoint outputs/dcgan/checkpoints/latest.pt --num-images 5000 --batch-size 64 --output-json outputs/metrics/dcgan_is.json
-python evaluate.py --metric fid --checkpoint outputs/dcgan/checkpoints/latest.pt --dataset folder --data-root data/celeba/img_align_celeba --num-images 5000 --batch-size 64 --output-json outputs/metrics/dcgan_fid.json
-python evaluate.py --metric both --checkpoint outputs/dcgan/checkpoints/latest.pt --dataset folder --data-root data/celeba/img_align_celeba --num-images 5000 --batch-size 64 --output-json outputs/metrics/dcgan_is_fid.json
+python interpolate.py --checkpoint outputs/dcgan/checkpoints/latest.pt --method spherical --steps 12 --output outputs/interpolation/dcgan_spherical.png
+python interpolate.py --checkpoint outputs/stylegan_lite/checkpoints/latest.pt --method spherical --steps 12 --output outputs/interpolation/stylegan_lite_spherical.png
+```
+
+## IS / FID / PPL 评估
+
+```powershell
+python evaluate.py --checkpoint outputs/dcgan/checkpoints/latest.pt --data-root data/celeba/img_align_celeba --metrics is5k --device cuda --output-json outputs/metrics/dcgan_is.json
+python evaluate.py --checkpoint outputs/dcgan/checkpoints/latest.pt --data-root data/celeba/img_align_celeba --metrics fid5k --device cuda --output-json outputs/metrics/dcgan_fid.json
+python evaluate.py --checkpoint outputs/dcgan/checkpoints/latest.pt --data-root data/celeba/img_align_celeba --metrics fid5k,is5k --device cuda --output-json outputs/metrics/dcgan_is_fid.json
 ```
 
 首次运行 IS/FID 评估时，torchvision 可能会下载 Inception v3 的预训练权重。FID 会把生成图片与真实数据集图片的 Inception 特征分布做比较，数值越低通常越好。输出格式类似：
@@ -163,6 +172,18 @@ python evaluate.py --metric both --checkpoint outputs/dcgan/checkpoints/latest.p
 ```text
 Inception Score: mean=2.3142, std=0.0821
 FID: 85.3721
+```
+
+PPL（Perceptual Path Length）衡量潜变量空间中相邻插值点生成图像的感知变化。DCGAN 只有原始噪声输入 z，没有 StyleGAN 的 mapping network，也就没有单独的 w 空间，因此 DCGAN 只能运行 `ppl_z`：
+
+```powershell
+python evaluate.py --checkpoint outputs/dcgan/checkpoints/latest.pt --data-root data/celeba/img_align_celeba --metrics ppl_z --device cuda --verbose --output-json outputs/metrics/dcgan_ppl_z.json
+```
+
+StyleGAN-Lite 或 StyleGAN2 可以同时评估 z 空间和 w 空间：
+
+```powershell
+python evaluate.py --checkpoint outputs/stylegan_lite/checkpoints/latest.pt --data-root data/celeba/img_align_celeba --metrics ppl_z,ppl_w --device cuda --verbose --output-json outputs/metrics/stylegan_lite_ppl.json
 ```
 
 ## 模型性能对比
