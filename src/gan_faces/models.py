@@ -82,6 +82,42 @@ class Discriminator(nn.Module):
         return self.net(image).view(-1)
 
 
+class WGANGPGenerator(Generator):
+    """DCGAN generator used with the WGAN-GP objective."""
+
+
+class WGANGPCritic(nn.Module):
+    """DCGAN-style critic for WGAN-GP, with BatchNorm replaced by per-sample norm."""
+
+    def __init__(self, image_channels: int = 3, feature_maps: int = 64) -> None:
+        super().__init__()
+        ndf = feature_maps
+
+        self.net = nn.Sequential(
+            # Input: N x 3 x 64 x 64
+            nn.Conv2d(image_channels, ndf, kernel_size=4, stride=2, padding=1),
+            nn.InstanceNorm2d(ndf, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+            # N x ndf x 32 x 32
+            nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2, padding=1),
+            nn.InstanceNorm2d(ndf * 2, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+            # N x (ndf*2) x 16 x 16
+            nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2, padding=1),
+            nn.InstanceNorm2d(ndf * 4, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+            # N x (ndf*4) x 8 x 8
+            nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=2, padding=1),
+            nn.InstanceNorm2d(ndf * 8, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+            # N x (ndf*8) x 4 x 4
+            nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1, padding=0),
+        )
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        return self.net(image).view(-1)
+
+
 class CycleResidualBlock(nn.Module):
     """CycleGAN 生成器中的残差块，保持特征图尺寸不变。"""
 
@@ -327,6 +363,20 @@ def init_dcgan_weights(module: nn.Module) -> None:
     elif classname.find("BatchNorm") != -1:
         nn.init.normal_(module.weight.data, 1.0, 0.02)
         nn.init.constant_(module.bias.data, 0.0)
+
+
+def init_wgan_gp_weights(module: nn.Module) -> None:
+    """DCGAN-style initialization for the WGAN-GP generator and critic."""
+
+    if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.normal_(module.weight.data, 0.0, 0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias.data)
+    elif isinstance(module, (nn.BatchNorm2d, nn.GroupNorm)):
+        if module.weight is not None:
+            nn.init.normal_(module.weight.data, 1.0, 0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias.data)
 
 
 def init_stylegan_lite_weights(module: nn.Module) -> None:

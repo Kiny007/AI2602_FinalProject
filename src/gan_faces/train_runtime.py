@@ -348,6 +348,8 @@ class TrainingLogger:
             metrics["loss_g"],
             metrics["d_real"],
             metrics["d_fake"],
+            metrics.get("gp", ""),
+            metrics.get("wasserstein", ""),
             lr_g,
             lr_d,
         ]
@@ -378,6 +380,8 @@ class TrainingLogger:
             d_fake=metrics["d_fake"],
             lr_g=lr_g,
             lr_d=lr_d,
+            gp=metrics.get("gp", None),
+            wasserstein=metrics.get("wasserstein", None),
         )
         if extras:
             add_scalar_groups(self.writer, extras, global_step)

@@ -13,6 +13,7 @@ from .. import nvidia_dnnlib as dnnlib
 from . import frechet_inception_distance
 from . import inception_score
 from . import kernel_inception_distance
+from . import ndb_score
 from . import precision_recall
 
 #----------------------------------------------------------------------------
@@ -106,5 +107,11 @@ def pr5k3(opts):
     opts.dataset_kwargs.update(max_size=None)
     precision, recall = precision_recall.compute_pr(opts, max_real=5000, num_gen=5000, nhood_size=3, row_batch_size=10000, col_batch_size=10000)
     return dict(pr5k3_precision=precision, pr5k3_recall=recall)
+
+@register_metric
+def ndb5k(opts):
+    opts.dataset_kwargs.update(max_size=None)
+    ndb, ndb_ratio, js = ndb_score.compute_ndb(opts, max_real=5000, num_gen=5000, number_of_bins=100)
+    return dict(ndb5k=ndb, ndb5k_ratio=ndb_ratio, ndb5k_jsd=js)
 
 #----------------------------------------------------------------------------

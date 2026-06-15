@@ -31,6 +31,8 @@ def add_training_scalars(
     d_fake: float,
     lr_g: float,
     lr_d: float,
+    gp: Optional[float],
+    wasserstein: Optional[float],
 ) -> None:
     """Log loss, discriminator confidence and learning rates."""
 
@@ -43,6 +45,10 @@ def add_training_scalars(
     writer.add_scalar("Loss/d_fake", d_fake, global_step)
     writer.add_scalar("LearningRate/generator", lr_g, global_step)
     writer.add_scalar("LearningRate/discriminator", lr_d, global_step)
+    if gp is not None:
+        writer.add_scalar("Loss/gradient_penalty", gp, global_step)
+    if wasserstein is not None:
+        writer.add_scalar("Loss/wasserstein", wasserstein, global_step)
 
 
 def add_scalar_groups(writer: Optional[Any], scalars: Mapping[str, float], global_step: int) -> None:

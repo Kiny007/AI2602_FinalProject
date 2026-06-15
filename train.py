@@ -1,4 +1,4 @@
-"""DCGAN 训练入口。
+"""GAN 训练入口。
 
 当前入口采用更偏 NVIDIA 风格的训练组织方式：以 `kimg` 作为统一进度单位，
 并使用 accelerate 管理单卡/多卡与混合精度。
@@ -10,10 +10,12 @@ import argparse
 import copy
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import InitProcessGroupKwargs
 from torch import nn, optim
 
 
@@ -21,7 +23,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from gan_faces.data import build_dataloader, build_dataset
-from gan_faces.models import Discriminator, Generator, init_dcgan_weights
+from gan_faces.models import (
+    Discriminator,
+    Generator,
+    WGANGPCritic,
+    WGANGPGenerator,
+    init_dcgan_weights,
+    init_wgan_gp_weights,
+)
 from gan_faces.config_utils import apply_config_defaults, load_yaml_config
 from gan_faces.eval.evaluate import AI2602GeneratorAdapter
 from gan_faces.eval.nvidia_evaluator import evaluate_adapter, parse_metrics
@@ -40,14 +49,14 @@ from gan_faces.utils import count_parameters, ensure_dir, make_noise, save_gener
 
 
 def parse_args() -> argparse.Namespace:
-    """解析 DCGAN 训练所需的命令行参数。"""
+    """解析 GAN 训练所需的命令行参数。"""
 
     default_config = PROJECT_ROOT / "src" / "gan_faces" / "config" / "dcgan.yaml"
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", type=str, default=str(default_config), help="YAML 配置文件路径")
     config_args, remaining_argv = config_parser.parse_known_args()
 
-    parser = argparse.ArgumentParser(description="训练 DCGAN 人头图像生成模型")
+    parser = argparse.ArgumentParser(description="训练 GAN 人头图像生成模型")
     parser.add_argument("--config", type=str, default=str(default_config), help="YAML 配置文件路径")
     parser.add_argument("--dataset", choices=["folder", "lfw", "celeba"], default="folder")
     parser.add_argument("--data-root", type=str, default="data/faces")
@@ -58,10 +67,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-dim", type=int, default=100)
     parser.add_argument("--generator-features", type=int, default=64)
     parser.add_argument("--discriminator-features", type=int, default=64)
+    parser.add_argument("--model-type", choices=["dcgan", "wgan_gp"], default="dcgan")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--beta1", type=float, default=0.5)
+    parser.add_argument("--beta2", type=float, default=0.999)
+    # [WGAN-GP 修改] 训练目标可在原始 DCGAN/BCE 和 WGAN-GP 之间切换。
+    parser.add_argument("--gan-loss", choices=["dcgan", "wgan_gp"], default="dcgan")
+    parser.add_argument("--gp-lambda", type=float, default=10.0, help="WGAN-GP 梯度惩罚系数")
+    parser.add_argument("--n-dis", type=int, default=1, help="每更新一次生成器前更新判别器/critic 的次数")
+    parser.add_argument("--mixed-precision", choices=["no", "fp16", "bf16"], default="fp16", help="accelerate 混合精度模式")
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--total-kimg", type=float, default=1000.0, help="总训练长度，单位 kimg")
+    parser.add_argument("--total-kimg", type=float, default=5000.0, help="总训练长度，单位 kimg")
     parser.add_argument("--kimg-per-log", type=float, default=0.5, help="每隔多少 kimg 打一次日志")
     parser.add_argument("--sample-every-kimg", type=float, default=1.0, help="每隔多少 kimg 保存一次样例图")
     parser.add_argument("--save-every-kimg", type=float, default=5.0, help="每隔多少 kimg 保存一次 checkpoint")
@@ -70,6 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-data-root", type=str, default="", help="中间评测使用的真实数据路径，默认与 data-root 相同")
     parser.add_argument("--eval-verbose", action="store_true", help="打印中间评测的详细进度")
     parser.add_argument("--no-eval-cache", action="store_true", help="禁用中间评测的真实特征缓存")
+    parser.add_argument("--ddp-timeout-minutes", type=int, default=180, help="DDP/NCCL sync timeout in minutes; useful when inline metrics are slow")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="生成器 EMA 衰减系数，<=0 时关闭")
     parser.add_argument("--tensorboard-dir", type=str, default="", help="TensorBoard 日志目录，默认 output-dir/tensorboard")
     parser.add_argument("--no-tensorboard", action="store_true", help="关闭 TensorBoard 日志写入")
@@ -93,16 +110,47 @@ def build_training_components(args: argparse.Namespace, device: torch.device):
         "image_channels": 3,
         "feature_maps": args.discriminator_features,
     }
-    generator = Generator(**model_args).to(device)
-    discriminator = Discriminator(**disc_args).to(device)
-    generator.apply(init_dcgan_weights)
-    discriminator.apply(init_dcgan_weights)
+    if args.model_type == "wgan_gp":
+        generator = WGANGPGenerator(**model_args).to(device)
+        discriminator = WGANGPCritic(**disc_args).to(device)
+        generator.apply(init_wgan_gp_weights)
+        discriminator.apply(init_wgan_gp_weights)
+    else:
+        generator = Generator(**model_args).to(device)
+        discriminator = Discriminator(**disc_args).to(device)
+        generator.apply(init_dcgan_weights)
+        discriminator.apply(init_dcgan_weights)
 
     criterion = nn.BCEWithLogitsLoss()
-    optimizer_g = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
-    optimizer_d = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
+    optimizer_g = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
+    optimizer_d = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
     return generator, discriminator, criterion, optimizer_g, optimizer_d, model_args, disc_args
 
+
+# [WGAN-GP 修改] 为 Wasserstein critic 计算梯度惩罚。
+def compute_gradient_penalty(
+    discriminator: nn.Module,
+    real_images: torch.Tensor,
+    fake_images: torch.Tensor,
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    batch_size = real_images.size(0)
+    alpha = torch.rand(batch_size, 1, 1, 1, device=real_images.device, dtype=real_images.dtype)
+    interpolated = (alpha * real_images + (1.0 - alpha) * fake_images).requires_grad_(True)
+
+    with accelerator.autocast():
+        mixed_scores = discriminator(interpolated)
+
+    gradients = torch.autograd.grad(
+        outputs=mixed_scores,
+        inputs=interpolated,
+        grad_outputs=torch.ones_like(mixed_scores),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    gradient_norm = gradients.float().flatten(1).norm(2, dim=1)
+    return ((gradient_norm - 1.0) ** 2).mean()
 
 def _next_kimg_boundary(cur_nimg: int, interval_kimg: float) -> int | None:
     """根据当前 nimg 计算下一次按 kimg 触发的边界。"""
@@ -128,9 +176,11 @@ def train(args: argparse.Namespace) -> None:
     """使用 accelerate 统一单卡、多卡与混合精度训练。"""
 
     ddp_kwargs = DistributedDataParallelKwargs(broadcast_buffers=False)
+    init_pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=args.ddp_timeout_minutes))
     accelerator = Accelerator(
         gradient_accumulation_steps=max(args.gradient_accumulation_steps, 1),
-        kwargs_handlers=[ddp_kwargs],
+        mixed_precision=args.mixed_precision,
+        kwargs_handlers=[ddp_kwargs, init_pg_kwargs],
     )
     device = accelerator.device
     world_size = accelerator.num_processes
@@ -154,11 +204,16 @@ def train(args: argparse.Namespace) -> None:
     optimizer_d = None
     fixed_noise = None
     scaler_state = None
+    generator_ema_state = None
     is_rank0 = accelerator.is_main_process
 
     try:
+        if args.gan_loss == "wgan_gp" and args.model_type == "dcgan":
+            args.model_type = "wgan_gp"
+        if args.model_type == "wgan_gp" and args.gan_loss != "wgan_gp":
+            raise ValueError("--model-type wgan_gp must be trained with --gan-loss wgan_gp")
         if args.image_size != 64:
-            raise ValueError("当前 DCGAN 结构固定输出 64x64 图片，请保持 --image-size 64")
+            raise ValueError("当前训练结构固定输出 64x64 图片，请保持 --image-size 64")
         if args.batch_size % world_size != 0:
             raise ValueError(f"--batch-size {args.batch_size} 不能被当前进程数 {world_size} 整除")
         if args.total_kimg <= 0:
@@ -169,7 +224,17 @@ def train(args: argparse.Namespace) -> None:
             raise ValueError("--sample-every-kimg 必须为正数")
         if args.save_every_kimg <= 0:
             raise ValueError("--save-every-kimg 必须为正数")
+        if args.n_dis <= 0:
+            raise ValueError("--n-dis 必须为正整数")
+        if args.ddp_timeout_minutes <= 0:
+            raise ValueError("--ddp-timeout-minutes must be positive")
+        if args.gan_loss == "wgan_gp" and args.gp_lambda <= 0:
+            raise ValueError("--gp-lambda 必须为正数")
         requested_metrics = parse_metrics(args.metrics) if args.metrics.strip() else []
+        if world_size > 1 and "ndb5k" in requested_metrics:
+            if is_rank0:
+                print("ndb5k inline eval only supports single GPU; skipping ndb5k for multi-GPU training.")
+            requested_metrics = [metric for metric in requested_metrics if metric != "ndb5k"]
 
         if is_rank0:
             layout = create_training_layout(args.output_dir, args.tensorboard_dir)
@@ -207,7 +272,7 @@ def train(args: argparse.Namespace) -> None:
             )
 
         generator, discriminator, criterion, optimizer_g, optimizer_d, model_args, disc_args = build_training_components(args, device)
-        generator_ema = copy.deepcopy(generator).eval() if is_rank0 and args.ema_decay > 0 else None
+        generator_ema = None
         if is_rank0:
             print(
                 f"参数量: G={count_parameters(generator):,}, D={count_parameters(discriminator):,}"
@@ -223,8 +288,7 @@ def train(args: argparse.Namespace) -> None:
             optimizer_g.load_state_dict(checkpoint["optimizer_g"])
             optimizer_d.load_state_dict(checkpoint["optimizer_d"])
             scaler_state = checkpoint.get("scaler")
-            if generator_ema is not None and "generator_ema" in checkpoint:
-                generator_ema.load_state_dict(checkpoint["generator_ema"])
+            generator_ema_state = checkpoint.get("generator_ema")
             current_epoch = int(checkpoint.get("epoch", 0)) + 1
             cur_nimg = int(checkpoint.get("cur_nimg", 0))
             global_step = int(checkpoint.get("global_step", cur_nimg // 1000))
@@ -238,6 +302,10 @@ def train(args: argparse.Namespace) -> None:
             optimizer_d,
             dataloader,
         )
+        if args.ema_decay > 0:
+            generator_ema = copy.deepcopy(accelerator.unwrap_model(generator)).eval().to(device)
+            if generator_ema_state is not None:
+                generator_ema.load_state_dict(generator_ema_state)
         if scaler_state is not None and getattr(accelerator, "scaler", None) is not None:
             accelerator.scaler.load_state_dict(scaler_state)
 
@@ -256,6 +324,8 @@ def train(args: argparse.Namespace) -> None:
                 init_model = generator_ema if generator_ema is not None else accelerator.unwrap_model(generator).eval()
                 init_samples = init_model(fixed_noise)
             logger.save_samples(init_samples, layout.sample_dir / "fakes_init.png", global_step=0, nrow=8)
+        if world_size > 1:
+            accelerator.wait_for_everyone()
 
         while cur_nimg < total_nimg:
             if interrupt_requested():
@@ -265,57 +335,116 @@ def train(args: argparse.Namespace) -> None:
             generator.train()
             discriminator.train()
 
-            for step, real_images in enumerate(dataloader, start=1):
+            data_iter = iter(dataloader)
+            step = 0
+            epoch_exhausted = False
+            while not epoch_exhausted:
                 if interrupt_requested():
                     raise KeyboardInterrupt
                 step_start = time.perf_counter()
-                real_images = real_images.to(device, non_blocking=True)
-                batch_size = real_images.size(0)
 
-                if is_rank0 and not saved_reals:
-                    save_generated_grid(real_images, layout.sample_dir / "reals.png", nrow=8)
-                    saved_reals = True
+                # [WGAN-GP 修改] 保留原 DCGAN BCE 损失，并新增 WGAN-GP 训练分支。
+                gradient_penalty = torch.zeros((), device=device)
+                wasserstein_estimate = torch.zeros((), device=device)
+                real_scores = torch.zeros((), device=device)
+                fake_scores = torch.zeros((), device=device)
+                loss_d = torch.zeros((), device=device)
+                batch_size = 0
+                d_updates = args.n_dis if args.gan_loss == "wgan_gp" else 1
 
-                real_targets = torch.ones(batch_size, device=device)
-                fake_targets = torch.zeros(batch_size, device=device)
+                generator_was_training = generator.training
+                
+                try:
+                    for _ in range(d_updates):
+                        try:
+                            real_images = next(data_iter)
+                        except StopIteration:
+                            epoch_exhausted = True
+                            break
 
-                with accelerator.accumulate(discriminator):
-                    optimizer_d.zero_grad(set_to_none=True)
-                    with accelerator.autocast():
-                        real_scores = discriminator(real_images)
-                        loss_d_real = criterion(real_scores.float(), real_targets.float())
+                        step += 1
+                        real_images = real_images.to(device, non_blocking=True)
+                        batch_size = real_images.size(0)
 
-                        noise = make_noise(batch_size, args.latent_dim, device)
-                        with torch.no_grad():
-                            fake_images_d = generator(noise)
-                        fake_scores = discriminator(fake_images_d)
-                        loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
-                        loss_d = loss_d_real + loss_d_fake
-                    accelerator.backward(loss_d)
-                    optimizer_d.step()
+                        if not saved_reals:
+                            if is_rank0:
+                                save_generated_grid(real_images, layout.sample_dir / "reals.png", nrow=8)
+                            saved_reals = True
+                            if world_size > 1:
+                                accelerator.wait_for_everyone()
+
+                        with accelerator.accumulate(discriminator):
+                            optimizer_d.zero_grad(set_to_none=True)
+                            noise = make_noise(batch_size, args.latent_dim, device)
+                            with torch.no_grad():
+                                fake_images_d = generator(noise)
+
+                            with accelerator.autocast():
+                                real_scores = discriminator(real_images)
+                                fake_scores = discriminator(fake_images_d)
+                                if args.gan_loss == "wgan_gp":
+                                    wasserstein_estimate = real_scores.float().mean() - fake_scores.float().mean()
+                                    gradient_penalty = compute_gradient_penalty(
+                                        discriminator,
+                                        real_images,
+                                        fake_images_d.detach(),
+                                        accelerator,
+                                    )
+                                    loss_d = -wasserstein_estimate + args.gp_lambda * gradient_penalty
+                                else:
+                                    real_targets = torch.ones(batch_size, device=device)
+                                    fake_targets = torch.zeros(batch_size, device=device)
+                                    loss_d_real = criterion(real_scores.float(), real_targets.float())
+                                    loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
+                                    loss_d = loss_d_real + loss_d_fake
+                            accelerator.backward(loss_d)
+                            optimizer_d.step()
+                finally:
+                    if args.gan_loss == "wgan_gp" and generator_was_training:
+                        generator.train()
+
+                if batch_size == 0:
+                    break
 
                 with accelerator.accumulate(generator):
                     optimizer_g.zero_grad(set_to_none=True)
-                    fool_targets = torch.ones(batch_size, device=device)
                     with accelerator.autocast():
                         noise = make_noise(batch_size, args.latent_dim, device)
                         fake_images_g = generator(noise)
                         fake_scores_for_g = discriminator(fake_images_g)
-                        loss_g = criterion(fake_scores_for_g.float(), fool_targets.float())
+                        if args.gan_loss == "wgan_gp":
+                            loss_g = -fake_scores_for_g.float().mean()
+                        else:
+                            fool_targets = torch.ones(batch_size, device=device)
+                            loss_g = criterion(fake_scores_for_g.float(), fool_targets.float())
                     accelerator.backward(loss_g)
                     optimizer_g.step()
 
                 if generator_ema is not None:
                     update_ema(generator_ema, generator, args.ema_decay)
 
-                metric_tensor = torch.stack(
-                    [
-                        loss_d.detach(),
-                        loss_g.detach(),
-                        torch.sigmoid(real_scores.detach()).mean(),
-                        torch.sigmoid(fake_scores.detach()).mean(),
-                    ]
-                )
+                if args.gan_loss == "wgan_gp":
+                    metric_tensor = torch.stack(
+                        [
+                            loss_d.detach(),
+                            loss_g.detach(),
+                            real_scores.detach().float().mean(),
+                            fake_scores.detach().float().mean(),
+                            gradient_penalty.detach(),
+                            wasserstein_estimate.detach(),
+                        ]
+                    )
+                else:
+                    metric_tensor = torch.stack(
+                        [
+                            loss_d.detach(),
+                            loss_g.detach(),
+                            torch.sigmoid(real_scores.detach()).mean(),
+                            torch.sigmoid(fake_scores.detach()).mean(),
+                            torch.zeros((), device=device),
+                            torch.zeros((), device=device),
+                        ]
+                    )
                 metric_tensor = accelerator.reduce(metric_tensor, reduction="mean")
                 metrics = {
                     "loss_d": metric_tensor[0].item(),
@@ -323,11 +452,19 @@ def train(args: argparse.Namespace) -> None:
                     "d_real": metric_tensor[2].item(),
                     "d_fake": metric_tensor[3].item(),
                 }
+                if args.gan_loss == "wgan_gp":
+                    metrics["gp"] = metric_tensor[4].item()
+                    metrics["wasserstein"] = metric_tensor[5].item()
                 global_batch_size = batch_size * world_size
                 cur_nimg += global_batch_size
                 global_step = int(cur_nimg // 1000)
                 cur_kimg = cur_nimg / 1000.0
                 reached_end = cur_nimg >= total_nimg
+                should_eval = False
+                if requested_metrics and args.eval_every_kimg > 0:
+                    should_eval = reached_end or (next_eval_nimg is not None and cur_nimg >= next_eval_nimg)
+                    if should_eval and next_eval_nimg is not None and cur_nimg >= next_eval_nimg:
+                        next_eval_nimg = _next_kimg_boundary(cur_nimg, args.eval_every_kimg)
 
                 if is_rank0:
                     sec_per_step = time.perf_counter() - step_start
@@ -361,12 +498,15 @@ def train(args: argparse.Namespace) -> None:
                             lr_d=optimizer_d.param_groups[0]["lr"],
                             extras=extras,
                         )
+                        metric_suffix = ""
+                        if args.gan_loss == "wgan_gp":
+                            metric_suffix = f" GP={metrics['gp']:.4f} Wdist={metrics['wasserstein']:.4f}"
                         print(
                             f"Epoch {current_epoch} Step [{step}/{total_steps}] "
                             f"kimg={cur_kimg:.3f} time={_format_duration(elapsed_time)} "
                             f"sec/kimg={sec_per_kimg:.2f} "
                             f"Loss_D={metrics['loss_d']:.4f} Loss_G={metrics['loss_g']:.4f} "
-                            f"D(real)={metrics['d_real']:.4f} D(fake)={metrics['d_fake']:.4f}"
+                            f"D(real)={metrics['d_real']:.4f} D(fake)={metrics['d_fake']:.4f}{metric_suffix}"
                         )
 
                     should_sample = reached_end or (next_sample_nimg is not None and cur_nimg >= next_sample_nimg)
@@ -389,7 +529,8 @@ def train(args: argparse.Namespace) -> None:
                         )
 
                     state = {
-                        "model_type": "dcgan",
+                        "model_type": args.model_type,
+                        "training_objective": args.gan_loss,
                         "epoch": current_epoch,
                         "cur_nimg": cur_nimg,
                         "global_step": global_step,
@@ -407,24 +548,29 @@ def train(args: argparse.Namespace) -> None:
                     }
                     if should_save:
                         torch.save(state, layout.checkpoint_dir / "latest.pt")
-                        torch.save(state, layout.checkpoint_dir / f"dcgan_nimg_{cur_nimg:08d}.pt")
+                        torch.save(state, layout.checkpoint_dir / f"{args.model_type}_nimg_{cur_nimg:08d}.pt")
 
-                    should_eval = False
-                    if requested_metrics and args.eval_every_kimg > 0:
-                        should_eval = reached_end or (next_eval_nimg is not None and cur_nimg >= next_eval_nimg)
-                        if should_eval and next_eval_nimg is not None and cur_nimg >= next_eval_nimg:
-                            next_eval_nimg = _next_kimg_boundary(cur_nimg, args.eval_every_kimg)
-                    if should_eval:
-                        eval_model = generator_ema if generator_ema is not None else accelerator.unwrap_model(generator).eval()
-                        adapter = AI2602GeneratorAdapter.from_generator(eval_model, z_dim=args.latent_dim, device=device)
-                        adapter.eval().requires_grad_(False).to(device)
-                        eval_result = evaluate_adapter(
-                            adapter=adapter,
-                            data_path=args.eval_data_root or args.data_root,
-                            metrics=requested_metrics,
-                            verbose=args.eval_verbose,
-                            cache=not args.no_eval_cache,
-                        )
+
+                if should_eval:
+                    if is_rank0:
+                        print(f"Starting inline eval @ nimg={cur_nimg}, kimg={cur_kimg:.3f}: {requested_metrics}", flush=True)
+                    if world_size > 1:
+                        accelerator.wait_for_everyone()
+                    eval_model = generator_ema if generator_ema is not None else accelerator.unwrap_model(generator).eval()
+                    adapter = AI2602GeneratorAdapter.from_generator(eval_model, z_dim=args.latent_dim, device=device)
+                    adapter.eval().requires_grad_(False).to(device)
+                    eval_result = evaluate_adapter(
+                        adapter=adapter,
+                        data_path=args.eval_data_root or args.data_root,
+                        metrics=requested_metrics,
+                        verbose=args.eval_verbose,
+                        cache=not args.no_eval_cache,
+                        num_gpus=world_size,
+                        rank=accelerator.process_index,
+                    )
+                    if generator_ema is None:
+                        accelerator.unwrap_model(generator).train()
+                    if is_rank0:
                         metric_scalars = {
                             f"Metrics/{metric_name}/{key}": float(value)
                             for metric_name, values in eval_result["metrics"].items()
@@ -445,14 +591,16 @@ def train(args: argparse.Namespace) -> None:
                             },
                         )
                         print(f"中间评测 @ nimg={cur_nimg}, kimg={cur_kimg:.3f}: {eval_result['metrics']}")
-
+                        print(f"Finished inline eval @ nimg={cur_nimg}, kimg={cur_kimg:.3f}", flush=True)
+                    if world_size > 1:
+                        accelerator.wait_for_everyone()
                 if reached_end:
                     break
 
             current_epoch += 1
 
         if is_rank0:
-            print("DCGAN 训练完成。")
+            print(f"{args.model_type} 训练完成。")
     except KeyboardInterrupt:
         if is_rank0:
             print("\n收到中断信号，正在清理训练进程并释放资源...")
