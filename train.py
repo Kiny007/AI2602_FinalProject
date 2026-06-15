@@ -353,8 +353,7 @@ def train(args: argparse.Namespace) -> None:
                 d_updates = args.n_dis if args.gan_loss == "wgan_gp" else 1
 
                 generator_was_training = generator.training
-                if args.gan_loss == "wgan_gp":
-                    generator.eval()
+                
                 try:
                     for _ in range(d_updates):
                         try:
