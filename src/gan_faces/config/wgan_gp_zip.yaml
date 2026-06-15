@@ -2,12 +2,12 @@
 dataset: folder
 data_root: data/celeba_64.zip
 download: false
-output_dir: outputs/wgan_gp_acc_zip
-batch_size: 128
+output_dir: outputs/wgan_gp_acc_zip_new
+batch_size: 64
 image_size: 64
 latent_dim: 100
-generator_features: 64
-discriminator_features: 64
+generator_features: 128
+discriminator_features: 128
 model_type: wgan_gp
 lr: 0.0001
 beta1: 0.0
@@ -15,8 +15,8 @@ beta2: 0.9
 gan_loss: wgan_gp
 gp_lambda: 10.0
 n_dis: 5
-mixed_precision: "no"
-workers: 0
+mixed_precision: "bf16"
+workers: 4
 kimg_per_log: 0.5
 total_kimg: 5000.0
 sample_every_kimg: 100.0
