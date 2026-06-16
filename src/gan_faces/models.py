@@ -96,7 +96,6 @@ class WGANGPCritic(nn.Module):
         self.net = nn.Sequential(
             # Input: N x 3 x 64 x 64
             nn.Conv2d(image_channels, ndf, kernel_size=4, stride=2, padding=1),
-            nn.InstanceNorm2d(ndf, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
             # N x ndf x 32 x 32
             nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2, padding=1),
