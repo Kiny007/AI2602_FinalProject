@@ -26,10 +26,7 @@ from gan_faces.data import build_dataloader, build_dataset
 from gan_faces.models import (
     Discriminator,
     Generator,
-    WGANGPCritic,
-    WGANGPGenerator,
     init_dcgan_weights,
-    init_wgan_gp_weights,
 )
 from gan_faces.config_utils import apply_config_defaults, load_yaml_config
 from gan_faces.eval.evaluate import AI2602GeneratorAdapter
@@ -72,7 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta1", type=float, default=0.5)
     parser.add_argument("--beta2", type=float, default=0.999)
     # [WGAN-GP 修改] 训练目标可在原始 DCGAN/BCE 和 WGAN-GP 之间切换。
-    parser.add_argument("--gan-loss", choices=["dcgan", "wgan_gp"], default="dcgan")
+    parser.add_argument("--gan-loss", choices=["bce", "wgan"], default="bce")
+    parser.add_argument("--norm", choices=["sn","gp","bn","wo","sngp"], default="bn")
     parser.add_argument("--gp-lambda", type=float, default=10.0, help="WGAN-GP 梯度惩罚系数")
     parser.add_argument("--n-dis", type=int, default=1, help="每更新一次生成器前更新判别器/critic 的次数")
     parser.add_argument("--mixed-precision", choices=["no", "fp16", "bf16"], default="fp16", help="accelerate 混合精度模式")
@@ -109,17 +107,18 @@ def build_training_components(args: argparse.Namespace, device: torch.device):
     disc_args = {
         "image_channels": 3,
         "feature_maps": args.discriminator_features,
+        "norm": args.norm,
     }
-    if args.model_type == "wgan_gp":
-        generator = WGANGPGenerator(**model_args).to(device)
-        discriminator = WGANGPCritic(**disc_args).to(device)
-        generator.apply(init_wgan_gp_weights)
-        discriminator.apply(init_wgan_gp_weights)
-    else:
-        generator = Generator(**model_args).to(device)
-        discriminator = Discriminator(**disc_args).to(device)
-        generator.apply(init_dcgan_weights)
-        discriminator.apply(init_dcgan_weights)
+    # if args.model_type == "wgan_gp":
+    #     generator = WGANGPGenerator(**model_args).to(device)
+    #     discriminator = WGANGPCritic(**disc_args).to(device)
+    #     generator.apply(init_wgan_gp_weights)
+    #     discriminator.apply(init_wgan_gp_weights)
+    # else:
+    generator = Generator(**model_args).to(device)
+    discriminator = Discriminator(**disc_args).to(device)
+    generator.apply(init_dcgan_weights)
+    discriminator.apply(init_dcgan_weights)
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer_g = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
@@ -208,10 +207,6 @@ def train(args: argparse.Namespace) -> None:
     is_rank0 = accelerator.is_main_process
 
     try:
-        if args.gan_loss == "wgan_gp" and args.model_type == "dcgan":
-            args.model_type = "wgan_gp"
-        if args.model_type == "wgan_gp" and args.gan_loss != "wgan_gp":
-            raise ValueError("--model-type wgan_gp must be trained with --gan-loss wgan_gp")
         if args.image_size != 64:
             raise ValueError("当前训练结构固定输出 64x64 图片，请保持 --image-size 64")
         if args.batch_size % world_size != 0:
@@ -350,7 +345,7 @@ def train(args: argparse.Namespace) -> None:
                 fake_scores = torch.zeros((), device=device)
                 loss_d = torch.zeros((), device=device)
                 batch_size = 0
-                d_updates = args.n_dis if args.gan_loss == "wgan_gp" else 1
+                d_updates = args.n_dis
 
                 generator_was_training = generator.training
                 
@@ -382,25 +377,36 @@ def train(args: argparse.Namespace) -> None:
                             with accelerator.autocast():
                                 real_scores = discriminator(real_images)
                                 fake_scores = discriminator(fake_images_d)
-                                if args.gan_loss == "wgan_gp":
+                                if args.gan_loss == "wgan":
                                     wasserstein_estimate = real_scores.float().mean() - fake_scores.float().mean()
-                                    gradient_penalty = compute_gradient_penalty(
-                                        discriminator,
-                                        real_images,
-                                        fake_images_d.detach(),
-                                        accelerator,
-                                    )
-                                    loss_d = -wasserstein_estimate + args.gp_lambda * gradient_penalty
-                                else:
+                                    if args.norm in ["gp", "sngp"]:
+                                        gradient_penalty = compute_gradient_penalty(
+                                            discriminator,
+                                            real_images,
+                                            fake_images_d.detach(),
+                                            accelerator,
+                                        )
+                                        loss_d = -wasserstein_estimate + args.gp_lambda * gradient_penalty
+                                    else: 
+                                        loss_d = -wasserstein_estimate
+                                else: # loss == bce
                                     real_targets = torch.ones(batch_size, device=device)
                                     fake_targets = torch.zeros(batch_size, device=device)
                                     loss_d_real = criterion(real_scores.float(), real_targets.float())
                                     loss_d_fake = criterion(fake_scores.float(), fake_targets.float())
                                     loss_d = loss_d_real + loss_d_fake
+                                    if args.norm in ["gp", "sngp"]:
+                                        gradient_penalty = compute_gradient_penalty(
+                                            discriminator,
+                                            real_images,
+                                            fake_images_d.detach(),
+                                            accelerator,
+                                        )
+                                        loss_d += args.gp_lambda * gradient_penalty
                             accelerator.backward(loss_d)
                             optimizer_d.step()
                 finally:
-                    if args.gan_loss == "wgan_gp" and generator_was_training:
+                    if args.gan_loss == "wgan" and generator_was_training:
                         generator.train()
 
                 if batch_size == 0:
@@ -412,7 +418,7 @@ def train(args: argparse.Namespace) -> None:
                         noise = make_noise(batch_size, args.latent_dim, device)
                         fake_images_g = generator(noise)
                         fake_scores_for_g = discriminator(fake_images_g)
-                        if args.gan_loss == "wgan_gp":
+                        if args.gan_loss == "wgan":
                             loss_g = -fake_scores_for_g.float().mean()
                         else:
                             fool_targets = torch.ones(batch_size, device=device)
@@ -423,14 +429,14 @@ def train(args: argparse.Namespace) -> None:
                 if generator_ema is not None:
                     update_ema(generator_ema, generator, args.ema_decay)
 
-                if args.gan_loss == "wgan_gp":
+                if args.gan_loss == "wgan":
                     metric_tensor = torch.stack(
                         [
                             loss_d.detach(),
                             loss_g.detach(),
                             real_scores.detach().float().mean(),
                             fake_scores.detach().float().mean(),
-                            gradient_penalty.detach(),
+                            gradient_penalty.detach() if args.norm in ["gp", "sngp"] else torch.zeros((), device=device),
                             wasserstein_estimate.detach(),
                         ]
                     )
@@ -441,7 +447,7 @@ def train(args: argparse.Namespace) -> None:
                             loss_g.detach(),
                             torch.sigmoid(real_scores.detach()).mean(),
                             torch.sigmoid(fake_scores.detach()).mean(),
-                            torch.zeros((), device=device),
+                            gradient_penalty.detach() if args.norm in ["gp", "sngp"] else torch.zeros((), device=device),
                             torch.zeros((), device=device),
                         ]
                     )
@@ -451,10 +457,9 @@ def train(args: argparse.Namespace) -> None:
                     "loss_g": metric_tensor[1].item(),
                     "d_real": metric_tensor[2].item(),
                     "d_fake": metric_tensor[3].item(),
+                    "gp": metric_tensor[4].item(),
+                    "wasserstein": metric_tensor[5].item(),
                 }
-                if args.gan_loss == "wgan_gp":
-                    metrics["gp"] = metric_tensor[4].item()
-                    metrics["wasserstein"] = metric_tensor[5].item()
                 global_batch_size = batch_size * world_size
                 cur_nimg += global_batch_size
                 global_step = int(cur_nimg // 1000)
@@ -499,8 +504,10 @@ def train(args: argparse.Namespace) -> None:
                             extras=extras,
                         )
                         metric_suffix = ""
-                        if args.gan_loss == "wgan_gp":
-                            metric_suffix = f" GP={metrics['gp']:.4f} Wdist={metrics['wasserstein']:.4f}"
+                        if args.gan_loss == "wgan":
+                            metric_suffix = f" Wdist={metrics['wasserstein']:.4f}"
+                            if args.norm in ["gp", "sngp"]:
+                                metric_suffix += f" GP={metrics['gp']:.4f}"
                         print(
                             f"Epoch {current_epoch} Step [{step}/{total_steps}] "
                             f"kimg={cur_kimg:.3f} time={_format_duration(elapsed_time)} "
