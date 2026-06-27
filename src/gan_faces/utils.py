@@ -67,15 +67,8 @@ def save_json(data: dict[str, Any], output_path: Union[str, Path]) -> None:
 def build_generator(model_type: str, model_args: dict[str, Any]) -> nn.Module:
     """根据 checkpoint 中的模型类型创建对应生成器。"""
 
-    if model_type == "dcgan":
-        return Generator(**model_args)
-    if model_type == "wgan_gp":
-        return WGANGPGenerator(**model_args)
-    if model_type == "stylegan_lite":
-        return StyleGeneratorLite(**model_args)
-    if model_type in {"cyclegan_a2b", "cyclegan_b2a"}:
-        return CycleGenerator(**model_args)
-    raise ValueError(f"未知生成器类型: {model_type}")
+    return Generator(**model_args)
+
 
 
 def count_parameters(model: nn.Module) -> int:
