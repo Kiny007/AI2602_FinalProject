@@ -1,8 +1,8 @@
 # 基于 GAN 的人头图像生成
 
-本项目根据 `project.pdf` 搭建：使用 DCGAN 完成基础人头图像生成，支持生成样例、潜变量线性插值、TensorBoard 训练可视化、Inception Score（IS）和 FID 评估，并补充 Bonus 1：对比轻量 StyleGAN 风格模型或 CycleGAN 与基础 DCGAN 的性能差异。
+本项目使用 DCGAN 完成基础人头图像生成，支持多卡混合精度训练、生成样例、潜变量线性插值、和 ID/FID 等多指标评估，对比了 BCE Loss、Wasserstein Loss、Hinge Loss 等损失函数和 梯度惩罚、谱归一化等正则化归一化方法，最后复现了 StyleGAN 模型，比较其与基础 DCGAN 的性能差异。
 
-## 项目结构
+<!-- ## 项目结构
 
 ```text
 .
@@ -21,13 +21,12 @@
 │   ├── tensorboard.py       # DCGAN TensorBoard 日志工具
 │   └── utils.py             # 随机种子、保存图片、加载模型等工具
 └── docs/project_requirements.md
-```
+``` -->
 
 ## 环境安装
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+conda create -n gan python==3.10
 pip install -r requirements.txt
 ```
 
@@ -42,11 +41,7 @@ pip install -r requirements.txt
 python train.py --dataset lfw --data-root data --download --epochs 20
 ```
 
-CelebA 体积较大，且下载通常需要手动授权；如果已经准备好数据，可以使用：
 
-```powershell
-python train.py --dataset celeba --data-root data --epochs 50
-```
 
 > [!NOTE]
 > 为了减少训练过程的cpu操作，我们把对图像的裁剪、统一格式等预处理放到了``pack_celeba.py``中，参考了英伟达StyleGAN2的实现，在训练前，先运行以下代码
@@ -87,52 +82,10 @@ python train.py --dataset folder --data-root data/celeba/img_align_celeba --outp
 - `outputs/dcgan/train_log.csv`：训练损失日志
 - `outputs/dcgan/tensorboard/`：TensorBoard 事件文件
 
-查看 TensorBoard：
 
-```powershell
-tensorboard --logdir outputs/dcgan/tensorboard
-```
 
-如果只想保存 CSV 和图片、不写 TensorBoard：
 
-```powershell
-python train.py --dataset folder --data-root data/celeba/img_align_celeba --output-dir outputs/dcgan --no-tensorboard
-```
 
-## Bonus 1：训练 StyleGAN-Lite
-
-为了完成“对比改进 GAN 模型与基础模型性能差异”，本项目实现了一个适合 64x64 CelebA 实验的轻量 StyleGAN 风格生成器。它包含 mapping network、learned constant、AdaIN 和 noise injection，但没有实现完整 StyleGAN/StyleGAN2 的全部训练技巧。
-
-```powershell
-python train_stylegan.py --dataset folder --data-root data/celeba/img_align_celeba --output-dir outputs/stylegan_lite --epochs 50 --batch-size 64
-```
-
-训练后会得到：
-
-- `outputs/stylegan_lite/checkpoints/latest.pt`
-- `outputs/stylegan_lite/samples/epoch_XXXX.png`
-- `outputs/stylegan_lite/train_log.csv`
-
-## Bonus 1：训练 CycleGAN
-
-如果选择用 CycleGAN 完成“改进 GAN 与基础 GAN 的性能差异对比”，需要准备两个无配对图片域。例如：
-
-- 域 A：普通人脸头像 `data/domain_a/`
-- 域 B：目标风格头像 `data/domain_b/`
-
-训练命令：
-
-```powershell
-python train_cyclegan.py --domain-a-root data/domain_a --domain-b-root data/domain_b --output-dir outputs/cyclegan --epochs 50 --batch-size 4
-```
-
-训练后会得到：
-
-- `outputs/cyclegan/checkpoints/latest.pt`
-- `outputs/cyclegan/samples/epoch_XXXX.png`
-- `outputs/cyclegan/train_log.csv`
-
-CycleGAN 是图像到图像翻译模型，不是从随机噪声直接生成头像；因此对比时脚本会用真实 A 域图片作为输入，评估 A->B 翻译结果。
 
 ## 生成头像
 
@@ -164,7 +117,18 @@ python evaluate.py --metric both --checkpoint outputs/dcgan/checkpoints/latest.p
 Inception Score: mean=2.3142, std=0.0821
 FID: 85.3721
 ```
+## 曲线可视化
+为了更清晰地展现训练过程中各指标的变化，我们设计了三个可视化脚本
+- ``plot_d_real_fake_curves.py`` 可视化了 BCE Loss 下判别器对合成图片和真实图片的评分
+- ``plot_loss_curves.py`` 可视化了生成器和判别器的损失曲线
+- ``plot_metric_cureve.py`` 可视化了FID变化情况 
 
+请从tensorboard中下载对应曲线的csv文件，放到对应文件夹，然后运行
+```
+python plot_d_real_fake_curves.py --input-dir outputs/[path to your folder of csvs]
+python plot_loss_curves.py --input-dir outputs/[path to your folder of csvs] 
+python plot_metric_curve.py --input-csv outputs/[path to your fid csv]  --title "FID5K Curve" --ylabel "FID5K" --color "#9467bd" 
+```
 ## 模型性能对比
 
 训练完两个模型后运行：
@@ -184,27 +148,12 @@ python compare_models.py --dcgan-checkpoint outputs/dcgan/checkpoints/latest.pt 
 - `outputs/metrics/model_comparison.json`
 - `outputs/metrics/model_comparison.csv`
 
-## 基础 GAN 与 CycleGAN 性能对比
 
-训练完 DCGAN 和 CycleGAN 后运行：
+## Bonus：训练 StyleGAN
 
-```powershell
-python compare_gan_cyclegan.py --dcgan-checkpoint outputs/dcgan/checkpoints/latest.pt --cyclegan-checkpoint outputs/cyclegan/checkpoints/latest.pt --domain-a-root data/domain_a --domain-b-root data/domain_b --direction a2b --num-images 1000 --batch-size 64
-```
+为了对比改进 GAN 模型与基础模型性能差异，本项目基于英伟达官方仓库实现了 StyleGAN2 和 StyleGAN-ada，具体操作参见[此代码仓库](https://github.com/sunnyxrxrx/stylegan2-ada-pytorch)。
 
-脚本会对比：
-
-- 生成器参数量和完整训练模型参数量
-- 生成速度 images/s
-- Inception Score 均值与标准差
-- CycleGAN 的循环重建误差 `cycle_l1`
-
-结果保存到：
-
-- `outputs/metrics/gan_vs_cyclegan.json`
-- `outputs/metrics/gan_vs_cyclegan.csv`
-
-报告中需要说明：DCGAN 的输入是随机噪声，CycleGAN 的输入是真实源域图片；二者任务不同，IS 和速度可以横向参考，但 CycleGAN 的 `cycle_l1` 只用于判断自身的域转换一致性。
+本仓库已经适配 StyleGAN 模型的评估。
 
 ## 已覆盖的基本要求
 
@@ -219,4 +168,4 @@ python compare_gan_cyclegan.py --dcgan-checkpoint outputs/dcgan/checkpoints/late
 
 | Bonus 任务 | 对应实现 |
 | --- | --- |
-| 对比改进 GAN 模型与基础模型性能差异 | `train_stylegan.py`、`compare_models.py`、`train_cyclegan.py`、`compare_gan_cyclegan.py`、`src/gan_faces/models.py` |
+| 对比改进 GAN 模型与基础模型性能差异 | 参见[此代码仓库](https://github.com/sunnyxrxrx/stylegan2-ada-pytorch) |
